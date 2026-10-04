@@ -1,10 +1,15 @@
 # ================================================================
-# 🐋 ETH WHALE — OK-EX IRAN V14
-# PAPER SIGNAL BOT — ALL USDT MARKETS
+# 🐋 ETH WHALE — OK-EX IRAN V15
+# PAPER SIGNAL BOT
+# ALL USDT MARKETS
+# LONG / SHORT / WAIT
+# RSI / EMA / MOMENTUM / VOLUME / PRICE ACTION / WHALE PROXY
+# NO REAL ORDERS
 # ================================================================
 
 import os
 import time
+import statistics
 import requests
 from datetime import datetime, timedelta
 
@@ -23,22 +28,22 @@ CANDLE_LIMIT = 100
 MAX_MARKETS = 227
 MAX_SIGNALS = 3
 
-MIN_SCORE = 70
-STRONG_SCORE = 80
+MIN_SCORE = 72
+STRONG_SCORE = 82
 
-MIN_VOLUME_RATIO = 1.20
+MIN_VOLUME_RATIO = 1.25
 MIN_EDGE = 15
 
 REQUEST_TIMEOUT = 20
+REQUEST_DELAY = 0.05
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
 SESSION = requests.Session()
-
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
+    "Accept": "application/json"
 })
 
 # ================================================================
@@ -48,13 +53,14 @@ SESSION.headers.update({
 STATS = {
     "pairs": 0,
     "tickers": 0,
-    "ticker_failed": 0,
     "candle_ok": 0,
     "candle_failed": 0,
     "candle_rows": 0,
     "analysis_passed": 0,
     "signals_found": 0,
     "signals_sent": 0,
+    "long_count": 0,
+    "short_count": 0,
 }
 
 # ================================================================
@@ -74,45 +80,36 @@ def now_text():
 # ================================================================
 
 def get_json(path, params=None):
-
     url = BASE_URL + path
 
     try:
-
-        r = SESSION.get(
+        response = SESSION.get(
             url,
             params=params,
             timeout=REQUEST_TIMEOUT
         )
 
-        if r.status_code != 200:
-
+        if response.status_code != 200:
             print(
                 f"[HTTP ERROR] {path} -> "
-                f"{r.status_code}"
+                f"{response.status_code}"
             )
-
-            print(r.text[:1000])
-
+            print(response.text[:1000])
             return None
 
         try:
-            return r.json()
+            return response.json()
 
         except Exception:
-
             print("[JSON ERROR]")
-            print(r.text[:1000])
-
+            print(response.text[:1000])
             return None
 
     except Exception as e:
-
         print(
-            f"[REQUEST ERROR] "
-            f"{path}: {e}"
+            f"[REQUEST ERROR] {path}: "
+            f"{repr(e)}"
         )
-
         return None
 
 
@@ -123,12 +120,10 @@ def get_json(path, params=None):
 def telegram(message):
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
-
         print(
             "[TELEGRAM ERROR] "
             "Missing token/chat id"
         )
-
         return False
 
     url = (
@@ -139,29 +134,29 @@ def telegram(message):
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
 
     try:
 
-        r = SESSION.post(
+        response = SESSION.post(
             url,
             data=payload,
             timeout=REQUEST_TIMEOUT
         )
 
-        if r.status_code == 200:
+        if response.status_code == 200:
 
             STATS["signals_sent"] += 1
-
             return True
 
         print(
             "[TELEGRAM ERROR]",
-            r.status_code
+            response.status_code
         )
 
-        print(r.text[:500])
+        print(response.text[:500])
 
         return False
 
@@ -169,7 +164,7 @@ def telegram(message):
 
         print(
             "[TELEGRAM REQUEST ERROR]",
-            e
+            repr(e)
         )
 
         return False
@@ -191,11 +186,6 @@ def get_pairs():
     if not data:
         return []
 
-    print(
-        "[PAIR RESPONSE]",
-        str(data)[:500]
-    )
-
     result = None
 
     if isinstance(data, dict):
@@ -212,10 +202,7 @@ def get_pairs():
 
     if not isinstance(result, list):
 
-        print(
-            "[PAIR ERROR] Unknown format"
-        )
-
+        print("[PAIR ERROR] Unknown format")
         return []
 
     symbols = []
@@ -240,10 +227,9 @@ def get_pairs():
         if not symbol:
             continue
 
-        symbol = str(symbol).upper()
-
         symbol = (
-            symbol
+            str(symbol)
+            .upper()
             .replace("/", "-")
             .replace("_", "-")
         )
@@ -279,30 +265,34 @@ def get_tickers():
     )
 
     if not data:
-
-        STATS["ticker_failed"] += 1
-
         return {}
-
-    print(
-        "[TICKER RESPONSE]",
-        str(data)[:500]
-    )
 
     result = None
 
     if isinstance(data, dict):
 
-        if isinstance(data.get("tickers"), list):
+        if isinstance(
+            data.get("tickers"),
+            list
+        ):
             result = data["tickers"]
 
-        elif isinstance(data.get("res"), list):
+        elif isinstance(
+            data.get("res"),
+            list
+        ):
             result = data["res"]
 
-        elif isinstance(data.get("data"), list):
+        elif isinstance(
+            data.get("data"),
+            list
+        ):
             result = data["data"]
 
-        elif isinstance(data.get("result"), list):
+        elif isinstance(
+            data.get("result"),
+            list
+        ):
             result = data["result"]
 
     elif isinstance(data, list):
@@ -311,12 +301,7 @@ def get_tickers():
 
     if not isinstance(result, list):
 
-        print(
-            "[TICKER ERROR] Unknown format"
-        )
-
-        STATS["ticker_failed"] += 1
-
+        print("[TICKER ERROR] Unknown format")
         return {}
 
     tickers = {}
@@ -336,10 +321,9 @@ def get_tickers():
         if not symbol:
             continue
 
-        symbol = str(symbol).upper()
-
         symbol = (
-            symbol
+            str(symbol)
+            .upper()
             .replace("/", "-")
             .replace("_", "-")
         )
@@ -352,15 +336,30 @@ def get_tickers():
     STATS["tickers"] = len(tickers)
 
     print(
-        f"[TICKER OK] {len(tickers)} USDT tickers"
+        f"[TICKER OK] "
+        f"{len(tickers)} USDT tickers"
     )
 
     return tickers
 
 
 # ================================================================
-# TICKER PRICE
+# NUMERIC HELPERS
 # ================================================================
+
+def safe_float(value, default=0.0):
+
+    try:
+        number = float(value)
+
+        if number != number:
+            return default
+
+        return number
+
+    except Exception:
+        return default
+
 
 def get_price(ticker):
 
@@ -382,34 +381,39 @@ def get_price(ticker):
         if value is None:
             continue
 
-        try:
+        price = safe_float(value)
 
-            price = float(value)
-
-            if price > 0:
-                return price
-
-        except Exception:
-            pass
+        if price > 0:
+            return price
 
     return None
 
 
-# ================================================================
-# CANDLE REQUEST
-# ================================================================
+def get_quote_volume(ticker):
 
-def candle_request(symbol, params):
+    if not isinstance(ticker, dict):
+        return 0.0
 
-    print(
-        f"[CANDLE REQUEST] "
-        f"{symbol} -> {params}"
-    )
+    fields = [
+        "quoteVolume",
+        "quoteVol",
+        "turnover",
+        "amount"
+    ]
 
-    return get_json(
-        "/api/v1/spot/public/candles",
-        params=params
-    )
+    for field in fields:
+
+        value = ticker.get(field)
+
+        if value is None:
+            continue
+
+        number = safe_float(value)
+
+        if number > 0:
+            return number
+
+    return 0.0
 
 
 # ================================================================
@@ -421,10 +425,8 @@ def get_candles(symbol):
     end_dt = utc_now()
 
     start_dt = (
-        end_dt -
-        timedelta(
-            hours=CANDLE_LIMIT + 5
-        )
+        end_dt
+        - timedelta(hours=CANDLE_LIMIT + 5)
     )
 
     start_time = int(
@@ -435,95 +437,36 @@ def get_candles(symbol):
         end_dt.timestamp() * 1000
     )
 
-    # ------------------------------------------------------------
-    # ATTEMPT 1
-    # snake_case
-    # ------------------------------------------------------------
-
     params = {
         "symbol": symbol,
         "interval": CANDLE_INTERVAL,
         "limit": CANDLE_LIMIT,
-        "start_time": str(start_time),
-        "end_time": str(end_time),
+        "startTime": str(start_time),
+        "endTime": str(end_time)
     }
 
-    data = candle_request(
-        symbol,
-        params
+    print(
+        f"[CANDLE] {symbol}"
     )
 
-    # ------------------------------------------------------------
-    # ATTEMPT 2
-    # camelCase
-    # ------------------------------------------------------------
-
-    if data is None:
-
-        params = {
-            "symbol": symbol,
-            "interval": CANDLE_INTERVAL,
-            "limit": CANDLE_LIMIT,
-            "startTime": str(start_time),
-            "endTime": str(end_time),
-        }
-
-        data = candle_request(
-            symbol,
-            params
-        )
-
-    # ------------------------------------------------------------
-    # ATTEMPT 3
-    # timestamp names
-    # ------------------------------------------------------------
-
-    if data is None:
-
-        params = {
-            "symbol": symbol,
-            "interval": CANDLE_INTERVAL,
-            "limit": CANDLE_LIMIT,
-            "start": str(start_time),
-            "end": str(end_time),
-        }
-
-        data = candle_request(
-            symbol,
-            params
-        )
-
-    # ------------------------------------------------------------
-    # No response
-    # ------------------------------------------------------------
+    data = get_json(
+        "/api/v1/spot/public/candles",
+        params=params
+    )
 
     if not data:
-
         return []
-
-    print(
-        f"[CANDLE RESPONSE] "
-        f"{symbol}: {str(data)[:700]}"
-    )
-
-    # ------------------------------------------------------------
-    # Extract result
-    # ------------------------------------------------------------
 
     result = None
 
     if isinstance(data, dict):
 
-        result = data.get("res")
-
-        if result is None:
-            result = data.get("data")
-
-        if result is None:
-            result = data.get("result")
-
-        if result is None:
-            result = data.get("candles")
+        result = (
+            data.get("res")
+            or data.get("data")
+            or data.get("result")
+            or data.get("candles")
+        )
 
     elif isinstance(data, list):
 
@@ -540,114 +483,108 @@ def get_candles(symbol):
 
     candles = []
 
-    # ------------------------------------------------------------
-    # Parse candles
-    # ------------------------------------------------------------
-
     for row in result:
 
         try:
-
-            # ----------------------------------------------------
-            # Array format
-            # ----------------------------------------------------
 
             if isinstance(row, list):
 
                 if len(row) < 5:
                     continue
 
-                timestamp = float(row[0])
-
-                open_price = float(row[1])
-                high = float(row[2])
-                low = float(row[3])
-                close = float(row[4])
+                timestamp = safe_float(row[0])
+                open_price = safe_float(row[1])
+                high = safe_float(row[2])
+                low = safe_float(row[3])
+                close = safe_float(row[4])
 
                 volume = 0.0
 
                 if len(row) >= 6:
-
-                    try:
-                        volume = float(row[5])
-
-                    except Exception:
-                        volume = 0.0
-
-                candles.append({
-                    "time": timestamp,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "volume": volume
-                })
-
-            # ----------------------------------------------------
-            # Dictionary format
-            # ----------------------------------------------------
+                    volume = safe_float(row[5])
 
             elif isinstance(row, dict):
 
-                open_price = (
+                open_price = safe_float(
                     row.get("open")
-                    or row.get("o")
+                    if row.get("open") is not None
+                    else row.get("o")
                 )
 
-                high = (
+                high = safe_float(
                     row.get("high")
-                    or row.get("h")
+                    if row.get("high") is not None
+                    else row.get("h")
                 )
 
-                low = (
+                low = safe_float(
                     row.get("low")
-                    or row.get("l")
+                    if row.get("low") is not None
+                    else row.get("l")
                 )
 
-                close = (
+                close = safe_float(
                     row.get("close")
-                    or row.get("c")
+                    if row.get("close") is not None
+                    else row.get("c")
                 )
 
-                volume = (
+                volume = safe_float(
                     row.get("volume")
-                    or row.get("v")
-                    or 0
+                    if row.get("volume") is not None
+                    else row.get("v")
                 )
 
-                if (
-                    open_price is None
-                    or high is None
-                    or low is None
-                    or close is None
-                ):
-                    continue
+                timestamp = safe_float(
+                    row.get("time")
+                    if row.get("time") is not None
+                    else row.get("timestamp")
+                )
 
-                candles.append({
-                    "time": row.get(
-                        "timestamp",
-                        row.get("time", 0)
-                    ),
-                    "open": float(open_price),
-                    "high": float(high),
-                    "low": float(low),
-                    "close": float(close),
-                    "volume": float(volume)
-                })
+            else:
+                continue
 
-        except Exception as e:
+            if (
+                open_price <= 0
+                or high <= 0
+                or low <= 0
+                or close <= 0
+            ):
+                continue
 
-            print(
-                f"[CANDLE ROW ERROR] "
-                f"{symbol}: {e}"
-            )
+            candles.append({
+                "time": timestamp,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume
+            })
 
+        except Exception:
             continue
 
-    print(
-        f"[CANDLE OK] "
-        f"{symbol}: {len(candles)} rows"
-    )
+    # ============================================================
+    # CRITICAL:
+    # OK-EX returns newest candle first.
+    # We need oldest -> newest for indicators.
+    # ============================================================
+
+    if len(candles) >= 2:
+
+        try:
+
+            if candles[0]["time"] > candles[-1]["time"]:
+
+                candles.reverse()
+
+                print(
+                    f"[CANDLE ORDER FIXED] "
+                    f"{symbol}"
+                )
+
+        except Exception:
+            pass
 
     return candles
 
@@ -661,14 +598,11 @@ def ema(values, period):
     if len(values) < period:
         return None
 
-    multiplier = (
-        2 / (period + 1)
-    )
+    multiplier = 2 / (period + 1)
 
-    value = (
-        sum(values[:period])
-        / period
-    )
+    value = sum(
+        values[:period]
+    ) / period
 
     for price in values[period:]:
 
@@ -742,14 +676,10 @@ def rsi(values, period=14):
     if avg_loss == 0:
         return 100.0
 
-    rs = (
-        avg_gain
-        / avg_loss
-    )
+    rs = avg_gain / avg_loss
 
-    return (
-        100
-        - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
     )
 
 
@@ -796,10 +726,67 @@ def atr(candles, period=14):
 
 
 # ================================================================
+# WHALE PROXY
+# ================================================================
+
+def whale_proxy(
+    ticker,
+    volume_ratio,
+    market_median_volume
+):
+
+    quote_volume = get_quote_volume(
+        ticker
+    )
+
+    score = 0
+
+    # Volume spike
+    if volume_ratio >= 4:
+        score += 40
+
+    elif volume_ratio >= 3:
+        score += 30
+
+    elif volume_ratio >= 2:
+        score += 20
+
+    elif volume_ratio >= 1.5:
+        score += 10
+
+    # Market liquidity
+    if market_median_volume > 0:
+
+        relative_liquidity = (
+            quote_volume
+            / market_median_volume
+        )
+
+        if relative_liquidity >= 10:
+            score += 40
+
+        elif relative_liquidity >= 5:
+            score += 30
+
+        elif relative_liquidity >= 2:
+            score += 20
+
+        elif relative_liquidity >= 1:
+            score += 10
+
+    return min(score, 80)
+
+
+# ================================================================
 # ANALYSIS
 # ================================================================
 
-def analyze(symbol, candles):
+def analyze(
+    symbol,
+    candles,
+    ticker,
+    market_median_volume
+):
 
     if len(candles) < 60:
         return None
@@ -816,15 +803,8 @@ def analyze(symbol, candles):
 
     price = closes[-1]
 
-    ema20 = ema(
-        closes,
-        20
-    )
-
-    ema50 = ema(
-        closes,
-        50
-    )
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
 
     rsi14 = rsi(
         closes,
@@ -845,7 +825,10 @@ def analyze(symbol, candles):
     ):
         return None
 
-    # Momentum
+    # ============================================================
+    # MOMENTUM
+    # ============================================================
+
     momentum = 0.0
 
     if len(closes) >= 11:
@@ -859,12 +842,11 @@ def analyze(symbol, candles):
                 / old_price
             ) * 100
 
-    # Volume ratio
-    previous_volumes = (
-        volumes[-21:-1]
-    )
+    # ============================================================
+    # VOLUME RATIO
+    # ============================================================
 
-    avg_volume = 0.0
+    previous_volumes = volumes[-21:-1]
 
     if previous_volumes:
 
@@ -872,6 +854,10 @@ def analyze(symbol, candles):
             sum(previous_volumes)
             / len(previous_volumes)
         )
+
+    else:
+
+        avg_volume = 0.0
 
     if avg_volume > 0:
 
@@ -884,47 +870,10 @@ def analyze(symbol, candles):
 
         volume_ratio = 0.0
 
-    # Scores
-    score_long = 0
-    score_short = 0
+    # ============================================================
+    # PRICE ACTION
+    # ============================================================
 
-    # Trend
-    if price > ema20:
-        score_long += 15
-
-    if ema20 > ema50:
-        score_long += 15
-
-    if price < ema20:
-        score_short += 15
-
-    if ema20 < ema50:
-        score_short += 15
-
-    # RSI
-    if 50 <= rsi14 <= 70:
-        score_long += 15
-
-    if 30 <= rsi14 < 50:
-        score_short += 15
-
-    # Momentum
-    if momentum > 1:
-        score_long += 15
-
-    if momentum < -1:
-        score_short += 15
-
-    # Volume
-    if volume_ratio >= MIN_VOLUME_RATIO:
-
-        if score_long > score_short:
-            score_long += 15
-
-        elif score_short > score_long:
-            score_short += 15
-
-    # Price action
     previous_high = max(
         closes[-11:-1]
     )
@@ -933,29 +882,147 @@ def analyze(symbol, candles):
         closes[-11:-1]
     )
 
-    if price > previous_high:
-        score_long += 15
+    breakout_long = (
+        price > previous_high
+    )
 
-    if price < previous_low:
-        score_short += 15
+    breakout_short = (
+        price < previous_low
+    )
 
-    # Direction
-    if score_long >= score_short:
+    # ============================================================
+    # BASE SCORE
+    # ============================================================
+
+    long_score = 0
+    short_score = 0
+
+    # EMA trend
+    if price > ema20:
+        long_score += 12
+
+    if ema20 > ema50:
+        long_score += 12
+
+    if price < ema20:
+        short_score += 12
+
+    if ema20 < ema50:
+        short_score += 12
+
+    # RSI
+    if 52 <= rsi14 <= 68:
+        long_score += 12
+
+    elif 45 <= rsi14 < 52:
+        short_score += 5
+
+    if 32 <= rsi14 <= 48:
+        short_score += 12
+
+    elif 48 < rsi14 <= 55:
+        short_score += 5
+
+    # Momentum
+    if momentum >= 2:
+        long_score += 12
+
+    elif momentum >= 1:
+        long_score += 6
+
+    if momentum <= -2:
+        short_score += 12
+
+    elif momentum <= -1:
+        short_score += 6
+
+    # Volume
+    if volume_ratio >= 4:
+        if long_score >= short_score:
+            long_score += 12
+        else:
+            short_score += 12
+
+    elif volume_ratio >= 2:
+        if long_score >= short_score:
+            long_score += 8
+        else:
+            short_score += 8
+
+    elif volume_ratio >= MIN_VOLUME_RATIO:
+        if long_score >= short_score:
+            long_score += 5
+        else:
+            short_score += 5
+
+    # Breakout
+    if breakout_long:
+        long_score += 12
+
+    if breakout_short:
+        short_score += 12
+
+    # ============================================================
+    # WHALE PROXY
+    # ============================================================
+
+    whale_score = whale_proxy(
+        ticker,
+        volume_ratio,
+        market_median_volume
+    )
+
+    if long_score > short_score:
+        long_score += int(
+            whale_score * 0.18
+        )
+
+    elif short_score > long_score:
+        short_score += int(
+            whale_score * 0.18
+        )
+
+    # ============================================================
+    # LIMIT
+    # ============================================================
+
+    long_score = min(
+        long_score,
+        100
+    )
+
+    short_score = min(
+        short_score,
+        100
+    )
+
+    # ============================================================
+    # DIRECTION
+    # ============================================================
+
+    if long_score > short_score:
 
         direction = "LONG"
-        score = score_long
+        score = long_score
+
+    elif short_score > long_score:
+
+        direction = "SHORT"
+        score = short_score
 
     else:
 
-        direction = "SHORT"
-        score = score_short
+        return None
 
     edge = abs(
-        score_long
-        - score_short
+        long_score
+        - short_score
     )
 
-    # Filters
+    # ============================================================
+    # QUALITY FILTER
+    # ============================================================
+
     if score < MIN_SCORE:
         return None
 
@@ -965,17 +1032,25 @@ def analyze(symbol, candles):
     if volume_ratio < MIN_VOLUME_RATIO:
         return None
 
-    # Entry / SL / TP
+    # ============================================================
+    # ATR RISK
+    # ============================================================
+
     risk = max(
         atr14 * 1.5,
         price * 0.008
     )
+
+    # ============================================================
+    # ENTRY / SL / TP
+    # ============================================================
 
     entry = price
 
     if direction == "LONG":
 
         sl = entry - risk
+
         tp1 = entry + risk
         tp2 = entry + risk * 2
         tp3 = entry + risk * 3
@@ -983,11 +1058,26 @@ def analyze(symbol, candles):
     else:
 
         sl = entry + risk
+
         tp1 = entry - risk
         tp2 = entry - risk * 2
         tp3 = entry - risk * 3
 
+    # ============================================================
+    # RISK REWARD
+    # ============================================================
+
+    rr1 = 1.0
+    rr2 = 2.0
+    rr3 = 3.0
+
     STATS["analysis_passed"] += 1
+    STATS["signals_found"] += 1
+
+    if direction == "LONG":
+        STATS["long_count"] += 1
+    else:
+        STATS["short_count"] += 1
 
     return {
         "symbol": symbol,
@@ -1001,7 +1091,12 @@ def analyze(symbol, candles):
         "tp3": tp3,
         "rsi": rsi14,
         "volume_ratio": volume_ratio,
-        "momentum": momentum
+        "momentum": momentum,
+        "whale_score": whale_score,
+        "quote_volume": get_quote_volume(ticker),
+        "rr1": rr1,
+        "rr2": rr2,
+        "rr3": rr3
     }
 
 
@@ -1012,22 +1107,30 @@ def analyze(symbol, candles):
 def make_signal_message(signal):
 
     if signal["direction"] == "LONG":
+
         emoji = "🟢"
+
     else:
+
         emoji = "🔴"
 
     if signal["score"] >= STRONG_SCORE:
+
         strength = "🔥 STRONG SIGNAL"
+
     else:
+
         strength = "⚡ SIGNAL"
 
     return f"""
-🐋 <b>ETH WHALE — OK-EX IRAN V14</b>
+🐋 <b>ETH WHALE — OK-EX IRAN V15</b>
 
 {emoji} <b>{signal["direction"]}</b>
 {strength}
 
 🪙 <b>{signal["symbol"]}</b>
+
+━━━━━━━━━━━━━━━━━━
 
 🎯 Score:
 <b>{signal["score"]}/100</b>
@@ -1035,20 +1138,8 @@ def make_signal_message(signal):
 📐 Edge:
 <b>{signal["edge"]}</b>
 
-💰 Entry:
-<b>{signal["entry"]:.8g}</b>
-
-🛑 SL:
-<b>{signal["sl"]:.8g}</b>
-
-🎯 TP1:
-<b>{signal["tp1"]:.8g}</b>
-
-🎯 TP2:
-<b>{signal["tp2"]:.8g}</b>
-
-🎯 TP3:
-<b>{signal["tp3"]:.8g}</b>
+🐋 Whale Proxy:
+<b>{signal["whale_score"]}/80</b>
 
 📊 RSI:
 <b>{signal["rsi"]:.2f}</b>
@@ -1058,6 +1149,31 @@ def make_signal_message(signal):
 
 📈 Momentum:
 <b>{signal["momentum"]:.2f}%</b>
+
+💧 Quote Volume:
+<b>{signal["quote_volume"]:.2f} USDT</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 Entry:
+<b>{signal["entry"]:.8g}</b>
+
+🛑 SL:
+<b>{signal["sl"]:.8g}</b>
+
+🎯 TP1:
+<b>{signal["tp1"]:.8g}</b>
+R/R: <b>1:1</b>
+
+🎯 TP2:
+<b>{signal["tp2"]:.8g}</b>
+R/R: <b>1:2</b>
+
+🎯 TP3:
+<b>{signal["tp3"]:.8g}</b>
+R/R: <b>1:3</b>
+
+━━━━━━━━━━━━━━━━━━
 
 🟢 Paper Mode: ON
 🔴 Real Orders: OFF
@@ -1073,9 +1189,9 @@ def make_signal_message(signal):
 def scan():
 
     print("")
-    print("=" * 60)
-    print("🐋 OK-EX IRAN V14")
-    print("=" * 60)
+    print("=" * 65)
+    print("🐋 OK-EX IRAN V15")
+    print("=" * 65)
 
     symbols = get_pairs()
 
@@ -1090,9 +1206,44 @@ def scan():
 
     tickers = get_tickers()
 
+    # ============================================================
+    # MARKET MEDIAN QUOTE VOLUME
+    # ============================================================
+
+    market_volumes = []
+
+    for ticker in tickers.values():
+
+        volume = get_quote_volume(
+            ticker
+        )
+
+        if volume > 0:
+            market_volumes.append(volume)
+
+    if market_volumes:
+
+        market_median_volume = (
+            statistics.median(
+                market_volumes
+            )
+        )
+
+    else:
+
+        market_median_volume = 0.0
+
+    print(
+        "[MARKET MEDIAN QUOTE VOLUME]",
+        market_median_volume
+    )
+
+    # ============================================================
+    # ANALYZE MARKETS
+    # ============================================================
+
     signals = []
 
-    # Scan all markets
     for index, symbol in enumerate(
         symbols,
         start=1
@@ -1103,29 +1254,31 @@ def scan():
             f"{symbol}"
         )
 
+        ticker = tickers.get(
+            symbol,
+            {}
+        )
+
         candles = get_candles(
             symbol
         )
 
         if not candles:
 
-            STATS[
-                "candle_failed"
-            ] += 1
-
+            STATS["candle_failed"] += 1
             continue
 
-        STATS[
-            "candle_ok"
-        ] += 1
+        STATS["candle_ok"] += 1
 
-        STATS[
-            "candle_rows"
-        ] += len(candles)
+        STATS["candle_rows"] += len(
+            candles
+        )
 
         signal = analyze(
             symbol,
-            candles
+            candles,
+            ticker,
+            market_median_volume
         )
 
         if signal:
@@ -1134,22 +1287,31 @@ def scan():
                 signal
             )
 
-            STATS[
-                "signals_found"
-            ] += 1
+        time.sleep(
+            REQUEST_DELAY
+        )
 
-    # Sort
+    # ============================================================
+    # SORT
+    # ============================================================
+
     signals.sort(
         key=lambda x: (
             x["score"],
             x["edge"],
+            x["whale_score"],
             x["volume_ratio"]
         ),
         reverse=True
     )
 
-    # Best signals
-    selected = signals[:MAX_SIGNALS]
+    selected = signals[
+        :MAX_SIGNALS
+    ]
+
+    # ============================================================
+    # SEND TOP SIGNALS
+    # ============================================================
 
     for signal in selected:
 
@@ -1159,7 +1321,12 @@ def scan():
             )
         )
 
-    # Average candles
+        time.sleep(1)
+
+    # ============================================================
+    # AVG CANDLES
+    # ============================================================
+
     if STATS["candle_ok"] > 0:
 
         avg_candles = (
@@ -1171,9 +1338,34 @@ def scan():
 
         avg_candles = 0
 
-    # Summary
+    # ============================================================
+    # TOP SIGNALS SUMMARY
+    # ============================================================
+
+    top_text = ""
+
+    for i, signal in enumerate(
+        selected,
+        start=1
+    ):
+
+        top_text += (
+            f"\n{i}. "
+            f"{signal['direction']} "
+            f"<b>{signal['symbol']}</b> "
+            f"— {signal['score']}/100"
+        )
+
+    if not top_text:
+
+        top_text = "\nNo qualifying signals."
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
+
     summary = f"""
-🔎 <b>SCAN COMPLETE — V14</b>
+🔎 <b>SCAN COMPLETE — V15</b>
 ━━━━━━━━━━━━━━━━━━
 
 🪙 Markets checked:
@@ -1203,8 +1395,19 @@ def scan():
 🎯 Signals found:
 <b>{STATS["signals_found"]}</b>
 
+🟢 LONG:
+<b>{STATS["long_count"]}</b>
+
+🔴 SHORT:
+<b>{STATS["short_count"]}</b>
+
 📨 Signals sent:
 <b>{len(selected)}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🏆 TOP SIGNALS
+{top_text}
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1219,6 +1422,9 @@ def scan():
 
 📐 Minimum Edge:
 <b>{MIN_EDGE}</b>
+
+🐋 Whale Proxy:
+<b>ON</b>
 
 🟢 Paper Mode:
 <b>ON</b>
@@ -1241,7 +1447,7 @@ def scan():
 if __name__ == "__main__":
 
     print(
-        "🐋 OK-EX IRAN V14 STARTED"
+        "🐋 OK-EX IRAN V15 STARTED"
     )
 
     print(
