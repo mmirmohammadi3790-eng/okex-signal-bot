@@ -25,35 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Test Telegram Connection
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          echo "Checking Telegram..."
-
-          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
-            echo "BOT TOKEN: MISSING"
-            exit 1
-          fi
-
-          if [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "CHAT ID: MISSING"
-            exit 1
-          fi
-
-          echo "BOT TOKEN: OK"
-          echo "CHAT ID: OK"
-
-          RESPONSE=$(curl -s \
-            -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=OK-EX BOT TEST - Telegram connection successful")
-
-          echo "$RESPONSE"
-
-      - name: Run bot
+      - name: Run OK-EX Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
