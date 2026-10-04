@@ -39,27 +39,19 @@ MAX_MARKETS = 9999
 MAX_SIGNALS_PER_SCAN = 3
 WATCHLIST_SIZE = 5
 
-# Minimum raw score
 MIN_SCORE = 50
-
-# Strong signal
 STRONG_SCORE = 70
 
-# Professional filters
 MIN_RR = 2.0
 
-# Avoid chasing extreme momentum
 MAX_LONG_MOMENTUM = 12.0
 MAX_SHORT_MOMENTUM = 12.0
 
-# RSI protection
 MAX_LONG_RSI = 70
 MIN_SHORT_RSI = 30
 
-# Minimum volume confirmation
 MIN_VOLUME_RATIO = 0.80
 
-# Candle
 CANDLE_INTERVAL = "1h"
 CANDLE_LIMIT = 100
 CANDLE_HOURS = 120
@@ -68,7 +60,7 @@ REQUEST_TIMEOUT = 20
 
 
 # ================================================================
-# TELEGRAM
+# TELEGRAM SECRETS
 # ================================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -76,7 +68,7 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 
 
 # ================================================================
-# SESSION
+# HTTP SESSION
 # ================================================================
 
 session = requests.Session()
@@ -95,17 +87,17 @@ last_sent = {}
 
 
 # ================================================================
-# TELEGRAM
+# TELEGRAM SEND
 # ================================================================
 
 def telegram_send(text):
 
     if not TELEGRAM_TOKEN:
-        print("Telegram token missing")
+        print("❌ TELEGRAM_TOKEN missing")
         return False
 
     if not CHAT_ID:
-        print("Chat ID missing")
+        print("❌ CHAT_ID missing")
         return False
 
     url = (
@@ -115,7 +107,7 @@ def telegram_send(text):
 
     try:
 
-        r = session.post(
+        response = session.post(
             url,
             data={
                 "chat_id": CHAT_ID,
@@ -126,13 +118,13 @@ def telegram_send(text):
             timeout=REQUEST_TIMEOUT,
         )
 
-        if r.status_code == 200:
+        if response.status_code == 200:
             return True
 
         print(
-            "Telegram error:",
-            r.status_code,
-            r.text[:500]
+            "❌ Telegram error:",
+            response.status_code,
+            response.text[:500]
         )
 
         return False
@@ -140,7 +132,7 @@ def telegram_send(text):
     except Exception as e:
 
         print(
-            "Telegram exception:",
+            "❌ Telegram exception:",
             repr(e)
         )
 
@@ -148,7 +140,7 @@ def telegram_send(text):
 
 
 # ================================================================
-# HTTP
+# GENERIC GET JSON
 # ================================================================
 
 def get_json(path, params=None):
@@ -157,28 +149,28 @@ def get_json(path, params=None):
 
     try:
 
-        r = session.get(
+        response = session.get(
             url,
             params=params,
             timeout=REQUEST_TIMEOUT,
         )
 
-        if r.status_code != 200:
+        if response.status_code != 200:
 
             print(
-                "HTTP ERROR:",
-                r.status_code,
-                r.text[:500]
+                "❌ HTTP ERROR:",
+                response.status_code,
+                response.text[:500]
             )
 
             return None
 
-        return r.json()
+        return response.json()
 
     except Exception as e:
 
         print(
-            "REQUEST ERROR:",
+            "❌ REQUEST ERROR:",
             repr(e)
         )
 
@@ -205,7 +197,7 @@ def normalize_symbol(symbol):
 
 
 # ================================================================
-# TICKERS
+# GET TICKERS
 # ================================================================
 
 def get_tickers():
@@ -264,7 +256,7 @@ def get_tickers():
 
         except Exception:
 
-            price = 0
+            price = 0.0
 
         if price <= 0:
             continue
@@ -280,7 +272,7 @@ def get_tickers():
 
         except Exception:
 
-            quote_volume = 0
+            quote_volume = 0.0
 
         try:
 
@@ -293,7 +285,7 @@ def get_tickers():
 
         except Exception:
 
-            change = 0
+            change = 0.0
 
         result[symbol] = {
             "price": price,
@@ -305,7 +297,7 @@ def get_tickers():
 
 
 # ================================================================
-# PAIRS
+# GET PAIRS
 # ================================================================
 
 def get_pairs():
@@ -366,7 +358,7 @@ def get_pairs():
 
 
 # ================================================================
-# MARKET DISCOVERY
+# DISCOVER MARKETS
 # ================================================================
 
 def discover_markets(tickers, pairs):
@@ -387,8 +379,11 @@ def discover_markets(tickers, pairs):
         )
 
         if common:
+
             markets = common
+
         else:
+
             markets = ticker_symbols
 
     elif ticker_symbols:
@@ -400,15 +395,16 @@ def discover_markets(tickers, pairs):
         markets = pair_symbols
 
     markets = [
-        x for x in markets
-        if x.endswith("USDT")
+        symbol
+        for symbol in markets
+        if symbol.endswith("USDT")
     ]
 
     return sorted(markets)[:MAX_MARKETS]
 
 
 # ================================================================
-# CANDLES
+# GET CANDLES
 # ================================================================
 
 def get_candles(symbol):
@@ -439,7 +435,6 @@ def get_candles(symbol):
         "endTime": end_time,
 
         "limit": CANDLE_LIMIT,
-
     }
 
     data = get_json(
@@ -518,19 +513,12 @@ def get_candles(symbol):
                 continue
 
             candles.append({
-
                 "time": float(timestamp),
-
                 "open": float(op),
-
                 "high": float(high),
-
                 "low": float(low),
-
                 "close": float(close),
-
                 "volume": float(volume),
-
             })
 
         except Exception:
@@ -557,9 +545,10 @@ def ema(values, period):
         period + 1
     )
 
-    value = sum(
-        values[:period]
-    ) / period
+    value = (
+        sum(values[:period])
+        / period
+    )
 
     for price in values[period:]:
 
@@ -637,10 +626,11 @@ def rsi(values, period=14):
         ) / period
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
     rs = (
-        avg_gain /
+        avg_gain
+        /
         avg_loss
     )
 
@@ -703,8 +693,10 @@ def analyze(symbol, candles, ticker):
 
     if (
         ema20 is None
-        or ema50 is None
-        or current_rsi is None
+        or
+        ema50 is None
+        or
+        current_rsi is None
     ):
         return None
 
@@ -742,7 +734,9 @@ def analyze(symbol, candles, ticker):
     # VOLUME
     # ============================================================
 
-    previous_volumes = volumes[-21:-1]
+    previous_volumes = (
+        volumes[-21:-1]
+    )
 
     if previous_volumes:
 
@@ -754,7 +748,7 @@ def analyze(symbol, candles, ticker):
 
     else:
 
-        avg_volume = 0
+        avg_volume = 0.0
 
     if avg_volume > 0:
 
@@ -766,11 +760,11 @@ def analyze(symbol, candles, ticker):
 
     else:
 
-        volume_ratio = 1
+        volume_ratio = 1.0
 
 
     # ============================================================
-    # BREAKOUT
+    # BREAKOUT / BREAKDOWN
     # ============================================================
 
     previous_high = max(
@@ -795,7 +789,7 @@ def analyze(symbol, candles, ticker):
 
 
     # ============================================================
-    # SCORE
+    # SCORES
     # ============================================================
 
     long_score = 0
@@ -806,7 +800,7 @@ def analyze(symbol, candles, ticker):
 
 
     # ============================================================
-    # EMA20
+    # PRICE / EMA20
     # ============================================================
 
     if price > ema20:
@@ -827,7 +821,7 @@ def analyze(symbol, candles, ticker):
 
 
     # ============================================================
-    # EMA50
+    # EMA20 / EMA50
     # ============================================================
 
     if ema20 > ema50:
@@ -939,7 +933,6 @@ def analyze(symbol, candles, ticker):
 
         else:
 
-            # Too hot: don't reward it
             long_reasons.append(
                 f"Momentum overheated +{momentum:.2f}%"
             )
@@ -962,7 +955,7 @@ def analyze(symbol, candles, ticker):
 
 
     # ============================================================
-    # TREND
+    # 10 CANDLE TREND
     # ============================================================
 
     if trend10 > 0.5:
@@ -1079,18 +1072,23 @@ def analyze(symbol, candles, ticker):
     if long_score > short_score:
 
         direction = "LONG"
+
         score = long_score
+
         reasons = long_reasons
 
     elif short_score > long_score:
 
         direction = "SHORT"
+
         score = short_score
+
         reasons = short_reasons
 
     else:
 
         direction = "WAIT"
+
         score = max(
             long_score,
             short_score
@@ -1105,65 +1103,56 @@ def analyze(symbol, candles, ticker):
 
     rejection = ""
 
-    # LONG protection
     if direction == "LONG":
 
         if current_rsi > MAX_LONG_RSI:
 
-            rejection = (
-                "RSI too high"
-            )
+            rejection = "RSI too high"
 
         elif momentum > MAX_LONG_MOMENTUM:
 
-            rejection = (
-                "Momentum overheated"
-            )
+            rejection = "Momentum overheated"
 
         elif volume_ratio < MIN_VOLUME_RATIO:
 
-            rejection = (
-                "Weak volume"
-            )
+            rejection = "Weak volume"
 
-    # SHORT protection
     elif direction == "SHORT":
 
         if current_rsi < MIN_SHORT_RSI:
 
-            rejection = (
-                "RSI too low"
-            )
+            rejection = "RSI too low"
 
         elif abs(momentum) > MAX_SHORT_MOMENTUM:
 
-            rejection = (
-                "Momentum overheated"
-            )
+            rejection = "Momentum overheated"
 
         elif volume_ratio < MIN_VOLUME_RATIO:
 
-            rejection = (
-                "Weak volume"
-            )
+            rejection = "Weak volume"
 
 
     # ============================================================
-    # PAPER LEVELS
+    # PAPER ENTRY / SL / TP
     # ============================================================
 
     entry = price
 
     if direction == "LONG":
 
-        # Dynamic-ish 1.5% base stop
         sl = entry * 0.985
 
         risk = entry - sl
 
         tp1 = entry + risk
-        tp2 = entry + (risk * 2)
-        tp3 = entry + (risk * 3)
+
+        tp2 = entry + (
+            risk * 2
+        )
+
+        tp3 = entry + (
+            risk * 3
+        )
 
     elif direction == "SHORT":
 
@@ -1172,8 +1161,14 @@ def analyze(symbol, candles, ticker):
         risk = sl - entry
 
         tp1 = entry - risk
-        tp2 = entry - (risk * 2)
-        tp3 = entry - (risk * 3)
+
+        tp2 = entry - (
+            risk * 2
+        )
+
+        tp3 = entry - (
+            risk * 3
+        )
 
     else:
 
@@ -1200,20 +1195,25 @@ def analyze(symbol, candles, ticker):
             tp2 - entry
         )
 
-        rr = (
-            reward_value /
-            risk_value
-            if risk_value > 0
-            else 0
-        )
+        if risk_value > 0:
+
+            rr = (
+                reward_value
+                /
+                risk_value
+            )
+
+        else:
+
+            rr = 0.0
 
     else:
 
-        rr = 0
+        rr = 0.0
 
 
     # ============================================================
-    # FINAL QUALITY
+    # FINAL VALIDATION
     # ============================================================
 
     valid_signal = True
@@ -1246,7 +1246,7 @@ def analyze(symbol, candles, ticker):
 
 
     # ============================================================
-    # WATCH STATUS
+    # SIGNAL TYPE
     # ============================================================
 
     if valid_signal:
@@ -1276,6 +1276,10 @@ def analyze(symbol, candles, ticker):
 
             signal_type = "WAIT"
 
+
+    # ============================================================
+    # RETURN
+    # ============================================================
 
     return {
 
@@ -1330,7 +1334,6 @@ def analyze(symbol, candles, ticker):
         "rejection": rejection,
 
         "reasons": reasons,
-
     }
 
 
@@ -1378,8 +1381,8 @@ def signal_message(a):
 
 
     reasons = "\n".join(
-        f"• {x}"
-        for x in a["reasons"][:7]
+        f"• {reason}"
+        for reason in a["reasons"][:7]
     )
 
 
@@ -1439,7 +1442,7 @@ EMA50:
 
 
 # ================================================================
-# WATCHLIST
+# WATCHLIST MESSAGE
 # ================================================================
 
 def watchlist_message(items):
@@ -1452,6 +1455,7 @@ def watchlist_message(items):
 این‌ها نزدیک‌ترین کاندیداها هستند:
 
 """
+
 
     for i, a in enumerate(
         items,
@@ -1505,6 +1509,7 @@ Liquidity Proxy
 🔴 Real Orders: OFF
 """
 
+
     return text
 
 
@@ -1531,6 +1536,10 @@ def scan():
     )
 
 
+    # ------------------------------------------------------------
+    # DATA
+    # ------------------------------------------------------------
+
     tickers = get_tickers()
 
     pairs = get_pairs()
@@ -1540,6 +1549,10 @@ def scan():
         pairs
     )
 
+
+    # ------------------------------------------------------------
+    # NO MARKETS
+    # ------------------------------------------------------------
 
     if not markets:
 
@@ -1568,7 +1581,7 @@ No USDT markets found.
 
 
     # ============================================================
-    # SCAN MARKETS
+    # MARKET LOOP
     # ============================================================
 
     for index, symbol in enumerate(
@@ -1644,12 +1657,21 @@ No USDT markets found.
             )
 
 
-        # Small delay for API stability
         time.sleep(0.05)
 
 
+        # Progress every 25 markets
+
+        if index % 25 == 0:
+
+            print(
+                f"Progress: "
+                f"{index}/{len(markets)}"
+            )
+
+
     # ============================================================
-    # SORT
+    # SORT ALL ANALYSES
     # ============================================================
 
     analyses.sort(
@@ -1663,8 +1685,9 @@ No USDT markets found.
     # ============================================================
 
     signals = [
-        x for x in analyses
-        if x["valid_signal"]
+        item
+        for item in analyses
+        if item["valid_signal"]
     ]
 
 
@@ -1677,7 +1700,6 @@ No USDT markets found.
     )
 
 
-    # Top 3 only
     signals = signals[
         :MAX_SIGNALS_PER_SCAN
     ]
@@ -1689,9 +1711,9 @@ No USDT markets found.
 
     sent = 0
 
-    for a in signals:
+    for item in signals:
 
-        symbol = a["symbol"]
+        symbol = item["symbol"]
 
         if not can_send(symbol):
 
@@ -1704,7 +1726,7 @@ No USDT markets found.
 
 
         if telegram_send(
-            signal_message(a)
+            signal_message(item)
         ):
 
             last_sent[
@@ -1719,12 +1741,17 @@ No USDT markets found.
     # ============================================================
 
     watchlist = [
-        x for x in analyses
+
+        item
+        for item in analyses
+
         if (
-            x["direction"]
+            item["direction"]
             in ("LONG", "SHORT")
+
             and
-            x["score"] >= 55
+
+            item["score"] >= 55
         )
     ]
 
@@ -1753,6 +1780,19 @@ No USDT markets found.
     # SUMMARY
     # ============================================================
 
+    if candle_ok:
+
+        avg_candles = (
+            total_rows
+            /
+            candle_ok
+        )
+
+    else:
+
+        avg_candles = 0
+
+
     summary = f"""
 🔎 <b>SCAN COMPLETE</b>
 
@@ -1769,11 +1809,7 @@ No USDT markets found.
 <b>{total_rows}</b>
 
 📐 Avg candles:
-<b>{
-    (total_rows / candle_ok)
-    if candle_ok
-    else 0
-:.1f}</b>
+<b>{avg_candles:.1f}</b>
 
 🧠 Analysis passed:
 <b>{len(analyses)}</b>
@@ -1868,7 +1904,7 @@ def startup():
 
 
 # ================================================================
-# MAIN
+# MAIN LOOP
 # ================================================================
 
 def main():
@@ -1884,7 +1920,7 @@ def main():
         except Exception as e:
 
             print(
-                "\nMAIN ERROR:",
+                "\n❌ MAIN ERROR:",
                 repr(e)
             )
 
