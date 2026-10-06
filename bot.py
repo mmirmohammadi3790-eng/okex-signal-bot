@@ -1,17 +1,16 @@
 import os
 import sys
-import traceback
 from datetime import datetime
 
 import requests
 
 
 # ============================================================
-# OK-EX PAPER SIGNAL BOT
-# NO REAL ORDERS
+# BITPIN TEST BOT
+# PAPER MODE ONLY - NO REAL ORDERS
 # ============================================================
 
-OKEX_BASE = "https://sapi.ok-ex.io"
+BITPIN_BASE = "https://api.bitpin.ir"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -20,8 +19,6 @@ TIMEOUT = 20
 
 PAPER_MODE = True
 REAL_ORDERS = False
-
-MAX_SYMBOLS = 30
 
 
 # ============================================================
@@ -36,20 +33,59 @@ def log(message):
 
 
 # ============================================================
+# BITPIN REQUEST
+# ============================================================
+
+def bitpin_get(endpoint, params=None):
+
+    url = BITPIN_BASE + endpoint
+
+    try:
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=TIMEOUT,
+            headers={
+                "User-Agent": "Bitpin-Paper-Test-Bot/1.0",
+                "Accept": "application/json"
+            }
+        )
+
+        log(
+            f"BITPIN GET {endpoint} -> "
+            f"HTTP {response.status_code}"
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except Exception as e:
+
+        log(f"BITPIN ERROR: {e}")
+
+        return None
+
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
 def telegram_send(message):
 
     if not TELEGRAM_TOKEN:
-        log("WARNING: TELEGRAM_BOT_TOKEN is missing.")
+        log("Telegram token is missing.")
         return False
 
     if not TELEGRAM_CHAT_ID:
-        log("WARNING: TELEGRAM_CHAT_ID is missing.")
+        log("Telegram chat ID is missing.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     try:
 
@@ -62,127 +98,63 @@ def telegram_send(message):
             timeout=TIMEOUT
         )
 
-        log(f"Telegram HTTP: {response.status_code}")
+        log(
+            f"TELEGRAM -> HTTP "
+            f"{response.status_code}"
+        )
 
         if response.ok:
-            log("Telegram message sent successfully.")
+
+            log("Telegram test successful.")
             return True
 
         log(response.text[:500])
+
         return False
 
     except Exception as e:
 
-        log(f"Telegram error: {e}")
+        log(f"Telegram ERROR: {e}")
+
         return False
-
-
-# ============================================================
-# OK-EX API
-# ============================================================
-
-def okex_get(endpoint, params=None):
-
-    url = OKEX_BASE + endpoint
-
-    try:
-
-        response = requests.get(
-            url,
-            params=params,
-            timeout=TIMEOUT,
-            headers={
-                "User-Agent": "OKEX-Paper-Signal-Bot/1.0"
-            }
-        )
-
-        log(
-            f"OK-EX GET {endpoint} -> "
-            f"HTTP {response.status_code}"
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except Exception as e:
-
-        log(f"OK-EX API ERROR: {e}")
-
-        return None
 
 
 # ============================================================
 # GET MARKETS
 # ============================================================
 
-def get_usdt_markets():
+def get_markets():
 
-    data = okex_get(
-        "/api/v1/spot/public/pairs"
+    data = bitpin_get(
+        "/api/v1/mkt/markets/"
     )
 
     if not data:
+
         return []
 
-    result = data.get("res", data)
+    if isinstance(data, list):
 
-    if isinstance(result, dict):
+        return data
+
+    if isinstance(data, dict):
 
         for key in [
+            "results",
             "data",
-            "list",
-            "pairs",
-            "result"
+            "markets"
         ]:
 
-            if isinstance(result.get(key), list):
-                result = result[key]
-                break
+            if isinstance(data.get(key), list):
 
-    if not isinstance(result, list):
-
-        log(
-            "Unexpected pairs response: "
-            + str(data)[:500]
-        )
-
-        return []
-
-    markets = []
-
-    for item in result:
-
-        if isinstance(item, str):
-
-            symbol = item
-
-        elif isinstance(item, dict):
-
-            symbol = (
-                item.get("symbol")
-                or item.get("instId")
-                or item.get("pair")
-                or ""
-            )
-
-        else:
-
-            continue
-
-        symbol = str(symbol).upper().strip()
-
-        if symbol.endswith("-USDT"):
-
-            markets.append(symbol)
-
-    markets = sorted(set(markets))
+                return data[key]
 
     log(
-        f"USDT markets found: {len(markets)}"
+        "Unknown markets response:"
+        + str(data)[:1000]
     )
 
-    return markets
+    return []
 
 
 # ============================================================
@@ -191,73 +163,80 @@ def get_usdt_markets():
 
 def get_tickers():
 
-    data = okex_get(
-        "/api/v1/spot/public/tickers"
+    data = bitpin_get(
+        "/api/v1/mkt/tickers/"
     )
 
     if not data:
+
         return []
 
-    result = data.get("res", data)
+    if isinstance(data, list):
 
-    if isinstance(result, dict):
+        return data
+
+    if isinstance(data, dict):
 
         for key in [
+            "results",
             "data",
-            "list",
-            "tickers",
-            "result"
+            "tickers"
         ]:
 
-            if isinstance(result.get(key), list):
+            if isinstance(data.get(key), list):
 
-                result = result[key]
-                break
-
-    if not isinstance(result, list):
-
-        log(
-            "Unexpected ticker response: "
-            + str(data)[:500]
-        )
-
-        return []
+                return data[key]
 
     log(
-        f"Tickers received: {len(result)}"
+        "Unknown ticker response:"
+        + str(data)[:1000]
     )
 
-    return result
+    return []
 
 
 # ============================================================
-# TICKER HELPERS
+# FIND SYMBOL
 # ============================================================
 
-def ticker_symbol(item):
+def get_symbol(item):
 
     if not isinstance(item, dict):
+
         return ""
 
-    return str(
-        item.get("symbol")
-        or item.get("instId")
-        or item.get("pair")
-        or ""
-    ).upper().strip()
+    for key in [
+        "symbol",
+        "market",
+        "pair",
+        "code"
+    ]:
+
+        value = item.get(key)
+
+        if value:
+
+            return str(value).upper()
+
+    return ""
 
 
-def ticker_price(item):
+# ============================================================
+# FIND PRICE
+# ============================================================
+
+def get_price(item):
 
     if not isinstance(item, dict):
+
         return None
 
     for key in [
         "last",
+        "last_price",
         "lastPrice",
-        "close",
         "price",
-        "lastPr"
+        "close"
     ]:
 
         value = item.get(key)
@@ -265,205 +244,26 @@ def ticker_price(item):
         if value not in [None, ""]:
 
             try:
+
                 return float(value)
 
             except Exception:
+
                 pass
 
     return None
 
 
-def ticker_volume(item):
-
-    if not isinstance(item, dict):
-        return 0
-
-    for key in [
-        "volume",
-        "vol",
-        "baseVolume",
-        "quoteVolume",
-        "turnover"
-    ]:
-
-        value = item.get(key)
-
-        if value not in [None, ""]:
-
-            try:
-                return float(value)
-
-            except Exception:
-                pass
-
-    return 0
-
-
 # ============================================================
-# PAPER SIGNAL
-# ============================================================
-
-def create_paper_signal(
-    symbol,
-    price,
-    volume
-):
-
-    if price is None:
-        return None
-
-    if price <= 0:
-        return None
-
-    # --------------------------------------------------------
-    # IMPORTANT
-    # This first version does NOT fabricate RSI/EMA/4H data.
-    # Therefore default direction is WAIT.
-    # --------------------------------------------------------
-
-    score = 0
-
-    direction = "WAIT"
-
-    if volume > 0:
-        score += 10
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "volume": volume,
-        "score": score,
-        "direction": direction
-    }
-
-
-# ============================================================
-# MARKET SCAN
-# ============================================================
-
-def scan():
-
-    log("")
-    log("========== MARKET SCAN ==========")
-
-    markets = get_usdt_markets()
-
-    if not markets:
-
-        log("ERROR: No USDT markets found.")
-
-        return []
-
-    tickers = get_tickers()
-
-    if not tickers:
-
-        log("ERROR: No tickers received.")
-
-        return []
-
-    ticker_map = {}
-
-    for item in tickers:
-
-        symbol = ticker_symbol(item)
-
-        if symbol:
-
-            ticker_map[symbol] = item
-
-    results = []
-
-    for symbol in markets[:MAX_SYMBOLS]:
-
-        item = ticker_map.get(symbol)
-
-        if not item:
-            continue
-
-        price = ticker_price(item)
-
-        volume = ticker_volume(item)
-
-        signal = create_paper_signal(
-            symbol,
-            price,
-            volume
-        )
-
-        if signal:
-
-            results.append(signal)
-
-    log(
-        f"Markets successfully scanned: "
-        f"{len(results)}"
-    )
-
-    return results
-
-
-# ============================================================
-# TELEGRAM REPORT
-# ============================================================
-
-def send_report(results):
-
-    if not results:
-
-        telegram_send(
-            "⚠️ OK-EX PAPER SCAN\n\n"
-            "No valid market data received."
-        )
-
-        return
-
-    results = sorted(
-        results,
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    top = results[:10]
-
-    lines = []
-
-    lines.append("📊 OK-EX PAPER SCAN")
-    lines.append("")
-    lines.append("🟢 API: ONLINE")
-    lines.append("🟢 MODE: PAPER ONLY")
-    lines.append("🔴 REAL ORDERS: OFF")
-    lines.append("")
-
-    for item in top:
-
-        lines.append(
-            f"⏸ {item['symbol']} | "
-            f"{item['direction']} | "
-            f"Price: {item['price']} | "
-            f"Score: {item['score']}"
-        )
-
-    lines.append("")
-    lines.append(
-        f"Markets scanned: {len(results)}"
-    )
-
-    telegram_send(
-        "\n".join(lines)
-    )
-
-
-# ============================================================
-# MAIN
+# MAIN TEST
 # ============================================================
 
 def main():
 
     log("")
-    log("==========================================")
-    log("OK-EX FUTURES SIGNAL BOT")
-    log("==========================================")
+    log("======================================")
+    log("BITPIN API TEST")
+    log("======================================")
 
     log(
         f"PAPER_MODE = {PAPER_MODE}"
@@ -473,109 +273,132 @@ def main():
         f"REAL_ORDERS = {REAL_ORDERS}"
     )
 
-    # Safety lock
-
     if REAL_ORDERS:
 
         log(
-            "FATAL ERROR: "
-            "REAL_ORDERS must be False."
+            "FATAL: REAL_ORDERS must be False."
         )
 
         return 1
 
     # --------------------------------------------------------
-    # Telegram configuration
+    # MARKET TEST
     # --------------------------------------------------------
 
-    if TELEGRAM_TOKEN:
+    log("")
+    log("Testing Bitpin markets API...")
 
-        log(
-            "TELEGRAM_BOT_TOKEN: configured"
-        )
-
-    else:
-
-        log(
-            "TELEGRAM_BOT_TOKEN: MISSING"
-        )
-
-    if TELEGRAM_CHAT_ID:
-
-        log(
-            "TELEGRAM_CHAT_ID: configured"
-        )
-
-    else:
-
-        log(
-            "TELEGRAM_CHAT_ID: MISSING"
-        )
-
-    # --------------------------------------------------------
-    # Test OK-EX
-    # --------------------------------------------------------
-
-    markets = get_usdt_markets()
+    markets = get_markets()
 
     if not markets:
 
-        log("")
         log(
-            "❌ OK-EX CONNECTION TEST FAILED"
+            "❌ MARKET API TEST FAILED"
         )
 
         return 1
 
+    log(
+        f"✅ Markets received: {len(markets)}"
+    )
+
+    # --------------------------------------------------------
+    # PRINT FIRST MARKETS
+    # --------------------------------------------------------
+
     log("")
-    log(
-        "✅ OK-EX CONNECTION TEST PASSED"
-    )
+    log("First markets:")
+
+    for item in markets[:10]:
+
+        symbol = get_symbol(item)
+
+        if symbol:
+
+            log(
+                f"  {symbol}"
+            )
+
+    # --------------------------------------------------------
+    # TICKER TEST
+    # --------------------------------------------------------
+
+    log("")
+    log("Testing Bitpin ticker API...")
+
+    tickers = get_tickers()
+
+    if not tickers:
+
+        log(
+            "❌ TICKER API TEST FAILED"
+        )
+
+        return 1
 
     log(
-        f"✅ USDT markets: {len(markets)}"
+        f"✅ Tickers received: {len(tickers)}"
     )
 
     # --------------------------------------------------------
-    # Telegram test
+    # PRINT SAMPLE PRICES
     # --------------------------------------------------------
+
+    log("")
+    log("Sample ticker prices:")
+
+    count = 0
+
+    for item in tickers:
+
+        symbol = get_symbol(item)
+
+        price = get_price(item)
+
+        if symbol and price is not None:
+
+            log(
+                f"  {symbol} = {price}"
+            )
+
+            count += 1
+
+        if count >= 10:
+
+            break
+
+    # --------------------------------------------------------
+    # TELEGRAM TEST
+    # --------------------------------------------------------
+
+    log("")
+    log("Testing Telegram...")
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
 
         telegram_send(
-            "🟢 OK-EX BOT TEST\n\n"
-            "OK-EX API: ONLINE\n"
-            "Telegram: ONLINE\n"
+            "🟢 BITPIN API TEST\n\n"
+            "Bitpin Markets API: ONLINE\n"
+            "Bitpin Ticker API: ONLINE\n"
+            "Telegram: TESTED\n"
             "Mode: PAPER ONLY\n"
-            "Real orders: OFF"
+            "Real Orders: OFF"
+        )
+
+    else:
+
+        log(
+            "Telegram secrets are not configured."
         )
 
     # --------------------------------------------------------
-    # Scan
+    # SUCCESS
     # --------------------------------------------------------
-
-    results = scan()
-
-    # --------------------------------------------------------
-    # Telegram report
-    # --------------------------------------------------------
-
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-
-        send_report(results)
 
     log("")
-    log(
-        "=========================================="
-    )
-
-    log(
-        "✅ BOT FINISHED SUCCESSFULLY"
-    )
-
-    log(
-        "=========================================="
-    )
+    log("======================================")
+    log("✅ BITPIN TEST COMPLETED")
+    log("======================================")
 
     return 0
 
@@ -595,21 +418,9 @@ if __name__ == "__main__":
     except Exception as e:
 
         log("")
-        log(
-            "❌ UNEXPECTED ERROR"
-        )
-
+        log("❌ UNEXPECTED ERROR")
         log(
             f"{type(e).__name__}: {e}"
         )
-
-        traceback.print_exc()
-
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-
-            telegram_send(
-                "🔴 OK-EX BOT ERROR\n\n"
-                f"{type(e).__name__}: {e}"
-            )
 
         sys.exit(1)
