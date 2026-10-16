@@ -1,204 +1,543 @@
 
 import os
-import sys
+import time
 import logging
-import requests
 from datetime import datetime, timezone
 
-# ============================================================
-# IRAN STOCK WHALE - CONNECTION DIAGNOSTIC
-# ONLY TESTS CONNECTIONS - NO TRADING
-# ============================================================
+import requests
 
-BOT_NAME = "IRAN STOCK WHALE DIAGNOSTIC"
+# ETH WHALE - TREND ONLY
+# No real orders
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BOT_NAME = "🐋 ETH WHALE"
+
+BINANCE_BASE = "https://data-api.binance.vision"
+BYBIT_BASE = "https://api.bybit.com"
+
+MAX_MARKETS = 25
+MIN_VOLUME_USDT = 2_000_000
+CANDLE_LIMIT = 100
+
+TIMEFRAMES = [
+    ("15m", "15"),
+    ("1h", "60"),
+    ("4h", "240"),
+]
+
+TELEGRAM_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    or os.getenv("TELEGRAM_TOKEN", "").strip()
+)
+
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    or os.getenv("CHAT_ID", "").strip()
+)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; MarketDiagnostic/1.0)",
-    "Accept": "*/*",
-})
+SESSION = requests.Session()
 
-def telegram_send(message):
-    if not TOKEN or not CHAT_ID:
-        logging.error("Telegram secrets are missing.")
+
+def get_json(url, params=None):
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=15,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as exc:
+            last_error = exc
+            time.sleep(attempt + 1)
+
+    raise RuntimeError(str(last_error))
+
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(message)
+        logging.error("Telegram secrets missing")
         return False
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
-    try:
-        response = requests.post(
+    for start in range(0, len(message), 3800):
+        response = SESSION.post(
             url,
             json={
-                "chat_id": CHAT_ID,
-                "text": message,
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message[start:start + 3800],
                 "disable_web_page_preview": True,
             },
             timeout=15,
         )
-
-        logging.info("Telegram HTTP status: %s", response.status_code)
         response.raise_for_status()
 
-        data = response.json()
-        return bool(data.get("ok"))
+        if not response.json().get("ok"):
+            raise RuntimeError("Telegram send failed")
 
-    except Exception as exc:
-        logging.error("Telegram failed: %s", str(exc)[:300])
-        return False
+    return True
 
 
-def test_url(name, url, params=None):
-    logging.info("Testing %s", name)
+def excluded_symbol(symbol):
+    if not symbol.endswith("USDT"):
+        return True
 
-    try:
-        response = session.get(
-            url,
-            params=params,
-            timeout=(6, 12),
-            allow_redirects=True,
+    base = symbol[:-4]
+
+    stablecoins = {
+        "USDC", "FDUSD", "TUSD", "USDP",
+        "DAI", "USDE", "USDD", "PYUSD",
+        "BUSD", "USTC", "USDS", "USD1",
+    }
+
+    if base in stablecoins:
+        return True
+
+    return base.endswith(("UP", "DOWN", "BULL", "BEAR"))
+
+def binance_markets():
+    data = get_json(
+        f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    )
+
+    if not isinstance(data, list):
+        raise RuntimeError("Invalid Binance ticker response")
+
+    markets = []
+
+    for item in data:
+        symbol = item.get("symbol", "")
+
+        if excluded_symbol(symbol):
+            continue
+
+        try:
+            price = float(item["lastPrice"])
+            volume = float(item["quoteVolume"])
+            change = float(item["priceChangePercent"])
+        except (ValueError, TypeError, KeyError):
+            continue
+
+        if price <= 0 or volume < MIN_VOLUME_USDT:
+            continue
+
+        markets.append({
+            "symbol": symbol,
+            "price": price,
+            "volume": volume,
+            "change": change,
+        })
+
+    markets.sort(
+        key=lambda item: item["volume"],
+        reverse=True,
+    )
+
+    return markets[:MAX_MARKETS]
+
+
+def binance_candles(symbol, interval):
+    data = get_json(
+        f"{BINANCE_BASE}/api/v3/klines",
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": CANDLE_LIMIT,
+        },
+    )
+
+    if not isinstance(data, list) or len(data) < 55:
+        raise RuntimeError("Insufficient Binance candles")
+
+    # Ignore the latest candle because it may be incomplete.
+    return [float(row[4]) for row in data[:-1]]
+
+
+def bybit_markets():
+    data = get_json(
+        f"{BYBIT_BASE}/v5/market/tickers",
+        params={"category": "spot"},
+    )
+
+    if data.get("retCode") != 0:
+        raise RuntimeError(
+            data.get("retMsg", "Bybit ticker error")
         )
 
-        content_type = response.headers.get(
-            "Content-Type", "unknown"
+    markets = []
+
+    for item in data.get("result", {}).get("list", []):
+        symbol = item.get("symbol", "")
+
+        if excluded_symbol(symbol):
+            continue
+
+        try:
+            price = float(item["lastPrice"])
+            volume = float(item["turnover24h"])
+            change = float(item["price24hPcnt"]) * 100
+        except (ValueError, TypeError, KeyError):
+            continue
+
+        if price <= 0 or volume < MIN_VOLUME_USDT:
+            continue
+
+        markets.append({
+            "symbol": symbol,
+            "price": price,
+            "volume": volume,
+            "change": change,
+        })
+
+    markets.sort(
+        key=lambda item: item["volume"],
+        reverse=True,
+    )
+
+    return markets[:MAX_MARKETS]
+
+
+def bybit_candles(symbol, interval):
+    data = get_json(
+        f"{BYBIT_BASE}/v5/market/kline",
+        params={
+            "category": "spot",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": CANDLE_LIMIT,
+        },
+    )
+
+    if data.get("retCode") != 0:
+        raise RuntimeError(
+            data.get("retMsg", "Bybit candle error")
         )
 
-        result = (
-            f"✅ {name}\n"
-            f"HTTP: {response.status_code}\n"
-            f"Final URL: {response.url[:180]}\n"
-            f"Content-Type: {content_type}\n"
-            f"Bytes: {len(response.content)}"
-        )
+    rows = data.get("result", {}).get("list", [])
+    rows = list(reversed(rows))
 
-        logging.info(
-            "%s | HTTP=%s | type=%s | bytes=%s",
-            name,
-            response.status_code,
-            content_type,
-            len(response.content),
-        )
+    if len(rows) < 55:
+        raise RuntimeError("Insufficient Bybit candles")
 
-        if response.status_code >= 400:
-            result = result.replace("✅", "⚠️")
+    # Exclude the latest potentially incomplete candle.
+    return [float(row[4]) for row in rows[:-1]]
 
-        if response.content:
-            preview = response.text[:100].replace("\n", " ")
-            logging.info("%s preview: %s", name, preview)
+def ema(values, period):
+    if len(values) < period:
+        raise ValueError("Not enough data for EMA")
 
-        return result
+    alpha = 2 / (period + 1)
+    result = sum(values[:period]) / period
 
-    except requests.exceptions.ConnectTimeout:
-        result = f"❌ {name}\nConnection timeout"
-    except requests.exceptions.ReadTimeout:
-        result = f"❌ {name}\nRead timeout"
-    except requests.exceptions.SSLError as exc:
-        result = f"❌ {name}\nSSL error: {str(exc)[:150]}"
-    except requests.exceptions.RequestException as exc:
-        result = f"❌ {name}\n{type(exc).__name__}: {str(exc)[:180]}"
-    except Exception as exc:
-        result = f"❌ {name}\n{type(exc).__name__}: {str(exc)[:180]}"
+    for value in values[period:]:
+        result = alpha * value + (1 - alpha) * result
 
-    logging.warning("%s", result.replace("\n", " | "))
     return result
 
 
-def main():
-    logging.info("Starting %s", BOT_NAME)
+def rsi(values, period=14):
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
 
-    results = []
-    results.append(
-        "🐋 IRAN STOCK WHALE\n"
-        "🧪 تست اتصال منابع داده\n"
-        "🚫 سفارش واقعی: غیرفعال"
-    )
+    if len(changes) < period:
+        return 50.0
 
-    # Test the Telegram API independently.
-    telegram_url = "https://api.telegram.org"
-    results.append(
-        test_url("Telegram API reachability", telegram_url)
-    )
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
-    market_params = {
-        "market": 0,
-        "withBestLimits": "false",
-        "hEven": 0,
-        "RefID": 0,
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def classify(closes):
+    fast = ema(closes, 20)
+    slow = ema(closes, 50)
+    price = closes[-1]
+    momentum = rsi(closes)
+
+    if fast > slow and price > fast:
+        if momentum >= 55:
+            label, score = "🟢 صعودی", 2
+        else:
+            label, score = "🟡 صعود ضعیف", 1
+
+    elif fast < slow and price < fast:
+        if momentum <= 45:
+            label, score = "🔴 نزولی", -2
+        else:
+            label, score = "🟡 نزول ضعیف", -1
+
+    else:
+        label, score = "🟡 خنثی", 0
+
+    return {
+        "label": label,
+        "score": score,
+        "rsi": momentum,
     }
 
-    for i in range(9):
-        market_params[f"paperTypes[{i}]"] = i + 1
 
-    # Test the existing market-watch API.
-    results.append(
-        test_url(
-            "TSETMC CDN API",
-            "https://cdn.tsetmc.com/api/ClosingPrice/GetMarketWatch",
-            params=market_params,
-        )
+def format_price(price):
+    if price >= 1000:
+        return f"{price:,.2f}"
+
+    if price >= 1:
+        return f"{price:.4f}".rstrip("0").rstrip(".")
+
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+
+def analyze(markets, candle_function):
+    results = []
+
+    for market in markets:
+        result = dict(market)
+        result["trends"] = {}
+
+        for timeframe, interval in TIMEFRAMES:
+            try:
+                closes = candle_function(
+                    market["symbol"], interval
+                )
+
+                result["trends"][timeframe] = classify(closes)
+
+            except Exception as exc:
+                logging.warning(
+                    "%s %s: %s",
+                    market["symbol"], timeframe, exc
+                )
+
+            time.sleep(0.1)
+
+        if result["trends"]:
+            results.append(result)
+
+    return results
+
+
+def overall_trend(results):
+    scores = [
+        item["trends"]["1h"]["score"]
+        for item in results
+        if "1h" in item["trends"]
+    ]
+
+    if not scores:
+        return "⚪ اطلاعات کافی برای تعیین روند وجود ندارد."
+
+    bullish = sum(score > 0 for score in scores)
+    bearish = sum(score < 0 for score in scores)
+    neutral = len(scores) - bullish - bearish
+    total = len(scores)
+
+    if bullish / total >= 0.60:
+        mood = "🟢 تمایل کلی بازار صعودی"
+    elif bearish / total >= 0.60:
+        mood = "🔴 تمایل کلی بازار نزولی"
+    else:
+        mood = "🟡 بازار ترکیبی یا خنثی"
+
+    return (
+        f"{mood}\n"
+        f"🟢 صعودی: {bullish}/{total}\n"
+        f"🔴 نزولی: {bearish}/{total}\n"
+        f"🟡 خنثی: {neutral}/{total}"
     )
 
-    # Test the alternative CDN hostname.
-    results.append(
-        test_url(
-            "TSETMC CDN10 API",
-            "https://cdn10.tsetmc.com/api/ClosingPrice/GetMarketWatch",
-            params=market_params,
-        )
-    )
 
-    # Test the legacy market-watch Excel endpoint.
-    results.append(
-        test_url(
-            "TSETMC legacy Excel",
-            "https://old.tsetmc.com/tsev2/excel/MarketWatchPlus.aspx",
-            params={"d": 0},
-        )
-    )
-
-    # Test the main TSETMC website separately.
-    results.append(
-        test_url(
-            "TSETMC website",
-            "https://www.tsetmc.com/",
-        )
-    )
-
-    # Test the TSE website separately.
-    results.append(
-        test_url(
-            "TSE website",
-            "https://www.tse.ir/",
-        )
-    )
-
-    timestamp = datetime.now(timezone.utc).strftime(
+def build_report(results, source):
+    now = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
     )
 
-    message = (
-        "🐋 IRAN STOCK WHALE\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🧪 گزارش تست اتصال\n"
-        f"🕒 {timestamp}\n"
-        "🚫 سفارش واقعی: خاموش\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        + "\n\n".join(results)
+    lines = [
+        BOT_NAME,
+        "━━━━━━━━━━━━━━━━━━",
+        "📊 گزارش روند بازار کریپتو",
+        "🧪 فقط تحلیل بازار؛ بدون معامله",
+        f"📡 منبع: {source}",
+        f"🕒 زمان: {now}",
+        "━━━━━━━━━━━━━━━━━━",
+        "🌐 وضعیت کلی بازار",
+        overall_trend(results),
+        "",
+    ]
+
+    btc = next(
+        (x for x in results if x["symbol"] == "BTCUSDT"),
+        None,
     )
 
-    # Keep Telegram messages within safe size limits.
-    for start in range(0, len(message), 3500):
-        telegram_send(message[start:start + 3500])
+    if btc:
+        lines.extend([
+            "₿ بیت‌کوین",
+            f"💵 قیمت: {format_price(btc['price'])} USDT",
+            f"📈 تغییر ۲۴ساعته: {btc['change']:+.2f}%",
+        ])
 
-    print("\n" + message)
-    logging.info("Diagnostic completed.")
+        for timeframe, _ in TIMEFRAMES:
+            trend = btc["trends"].get(timeframe)
+
+            if trend:
+                lines.append(
+                    f"{timeframe}: {trend['label']} "
+                    f"| RSI {trend['rsi']:.0f}"
+                )
+
+        lines.append("")
+
+    hourly = [
+        x for x in results if "1h" in x["trends"]
+    ]
+
+    bullish = sorted(
+        [x for x in hourly if x["trends"]["1h"]["score"] > 0],
+        key=lambda x: (
+            x["trends"]["1h"]["score"],
+            x["trends"].get("4h", {}).get("score", 0),
+            x["change"],
+        ),
+        reverse=True,
+    )
+
+    bearish = sorted(
+        [x for x in hourly if x["trends"]["1h"]["score"] < 0],
+        key=lambda x: (
+            x["trends"]["1h"]["score"],
+            x["trends"].get("4h", {}).get("score", 0),
+            x["change"],
+        ),
+    )
+
+    lines.append("🟢 ارزهای دارای روند صعودی | ۱ساعته")
+
+    if bullish:
+        for item in bullish[:8]:
+            lines.append(
+                f"• {item['symbol']} | "
+                f"{format_price(item['price'])} USDT | "
+                f"۲۴ساعت {item['change']:+.2f}%"
+            )
+
+            trend4 = item["trends"].get("4h")
+
+            if trend4:
+                lines.append(f"  روند ۴ساعته: {trend4['label']}")
+    else:
+        lines.append("موردی شناسایی نشد.")
+
+    lines.extend([
+        "",
+        "🔴 ارزهای دارای روند نزولی | ۱ساعته",
+    ])
+
+    if bearish:
+        for item in bearish[:8]:
+            lines.append(
+                f"• {item['symbol']} | "
+                f"{format_price(item['price'])} USDT | "
+                f"۲۴ساعت {item['change']:+.2f}%"
+            )
+
+            trend4 = item["trends"].get("4h")
+
+            if trend4:
+                lines.append(f"  روند ۴ساعته: {trend4['label']}")
+    else:
+        lines.append("موردی شناسایی نشد.")
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "ℹ️ گزارش روند است، نه توصیه خرید یا فروش.",
+        "🚫 سفارش واقعی: غیرفعال",
+    ])
+
+    return "\n".join(lines)
+
+
+def main():
+    try:
+        markets = binance_markets()
+        source = "Binance Public Data"
+        candle_function = binance_candles
+
+    except Exception as exc:
+        logging.warning("Binance unavailable: %s", exc)
+
+        try:
+            markets = bybit_markets()
+            source = "Bybit Public API (fallback)"
+            candle_function = bybit_candles
+
+        except Exception as fallback_exc:
+            message = (
+                f"{BOT_NAME}\n"
+                "❌ دریافت اطلاعات بازار ناموفق بود.\n"
+                f"Binance: {str(exc)[:200]}\n"
+                f"Bybit: {str(fallback_exc)[:200]}\n"
+                "هیچ روندی حدس زده نشده است."
+            )
+
+            send_telegram(message)
+            raise RuntimeError(
+                "Both market data sources failed"
+            ) from fallback_exc
+
+    if not markets:
+        raise RuntimeError("No eligible USDT markets found")
+
+    logging.info("Markets selected: %d", len(markets))
+
+    results = analyze(markets, candle_function)
+
+    if not results:
+        message = (
+            f"{BOT_NAME}\n"
+            "❌ کندل کافی برای تحلیل دریافت نشد."
+        )
+
+        send_telegram(message)
+        raise RuntimeError("No markets analyzed")
+
+    report = build_report(results, source)
+    send_telegram(report)
+
+    logging.info(
+        "Completed: %d markets analyzed",
+        len(results),
+    )
 
 
 if __name__ == "__main__":
