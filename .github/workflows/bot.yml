@@ -1,3 +1,4 @@
+
 name: OK-EX Signal Bot
 
 on:
@@ -8,6 +9,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,9 +24,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Run OK-EX Bot
+      - name: Check Telegram configuration
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "import os,sys; print('TELEGRAM_BOT_TOKEN:', 'SET' if os.getenv('TELEGRAM_BOT_TOKEN','').strip() else 'MISSING'); print('TELEGRAM_CHAT_ID:', 'SET' if os.getenv('TELEGRAM_CHAT_ID','').strip() else 'MISSING'); sys.exit(0 if os.getenv('TELEGRAM_BOT_TOKEN','').strip() and os.getenv('TELEGRAM_CHAT_ID','').strip() else 1)"
+
+      - name: Run Bitpin Telegram Test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -u bot.py
