@@ -622,3 +622,55 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ==========================================
+# SMART ENTRY FILTER — ETH WHALE
+# ==========================================
+
+MIN_LEVEL_DISTANCE_PCT = 0.30
+REQUIRE_CLOSED_CANDLE = True
+MAX_SIGNAL_COUNT = 1
+
+
+def distance_pct(price, level):
+    """فاصله درصدی قیمت تا حمایت یا مقاومت"""
+    if not price or not level:
+        return 999.0
+    return abs(price - level) / price * 100.0
+
+
+def check_entry_filter(
+    direction,
+    price,
+    support,
+    resistance,
+    candle_closed=True,
+):
+    """
+    فقط فیلتر فاصله از سطوح و بسته‌شدن کندل را بررسی می‌کند.
+    این تابع به‌تنهایی تأیید شکست حمایت یا مقاومت نیست.
+    """
+
+    if not candle_closed:
+        return False, "انتظار برای بسته‌شدن کندل"
+
+    if direction == "SHORT" and support:
+        dist = distance_pct(price, support)
+
+        if price > support and dist < MIN_LEVEL_DISTANCE_PCT:
+            return (
+                False,
+                f"فاصله تا حمایت فقط {dist:.2f}% است؛ "
+                "منتظر شکست معتبر حمایت بمان",
+            )
+
+    elif direction == "LONG" and resistance:
+        dist = distance_pct(price, resistance)
+
+        if price < resistance and dist < MIN_LEVEL_DISTANCE_PCT:
+            return (
+                False,
+                f"فاصله تا مقاومت فقط {dist:.2f}% است؛ "
+                "منتظر شکست معتبر مقاومت بمان",
+            )
+
+    return True, "فیلتر فاصله تأیید شد"
