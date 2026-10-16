@@ -1,159 +1,219 @@
 
 # ============================================================
-# ETH WHALE - BITPIN SMART MARKET WATCH
-# PAPER TRADING ONLY - NO REAL ORDERS
+# PART 2 - BITPIN MARKETS AND TICKERS
 # ============================================================
 
-import os
-import time
-import logging
-from datetime import datetime, timezone
+def unwrap_data(data):
+    """Extract list-like data from common API response formats."""
+    if isinstance(data, list):
+        return data
 
-import requests
+    if isinstance(data, dict):
+        for key in ("results", "data", "tickers", "markets",
+                    "pairs", "list", "result"):
+            value = data.get(key)
 
-# -------------------- CONFIGURATION -------------------------
+            if isinstance(value, list):
+                return value
 
-BOT_NAME = "ETH WHALE"
+            if isinstance(value, dict):
+                for nested_key in ("results", "data", "list"):
+                    nested = value.get(nested_key)
+                    if isinstance(nested, list):
+                        return nested
 
-BITPIN_BASE = "https://api.bitpin.ir"
-TELEGRAM_API = "https://api.telegram.org"
+        # Some ticker endpoints return a dictionary keyed by symbol.
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return [
+                dict(value, symbol=value.get("symbol", key))
+                for key, value in data.items()
+            ]
 
-# Paper trading configuration
-PAPER_MODE = True
-REAL_ORDERS_ENABLED = False
+    return []
 
-PAPER_CAPITAL = 48.0
-LEVERAGE = 3
-POSITION_MARGIN = PAPER_CAPITAL
-POSITION_VALUE = POSITION_MARGIN * LEVERAGE
 
-# Balanced signal filtering
-MIN_SIGNAL_SCORE = 60
-STRONG_SIGNAL_SCORE = 75
+def get_markets():
+    """Get available markets using a public endpoint."""
+    endpoints = [
+        "/api/v1/mkt/markets/",
+        "/api/v1/market/markets/",
+    ]
 
-# Technical analysis
-EMA_FAST = 20
-EMA_SLOW = 50
-RSI_PERIOD = 14
+    for path in endpoints:
+        try:
+            data = get_json(BITPIN_BASE + path)
+            items = unwrap_data(data)
 
-TIMEFRAME_FAST = "15m"
-TIMEFRAME_SLOW = "1h"
+            if items:
+                logger.info(
+                    "Markets endpoint worked: %s (%s items)",
+                    path, len(items)
+                )
+                return items
 
-# Risk management
-STOP_LOSS_ATR_MULTIPLIER = 1.5
-TAKE_PROFIT_R_MULTIPLIERS = [1.0, 2.0, 3.0]
+            logger.warning(
+                "Markets endpoint returned no usable items: %s",
+                path
+            )
 
-# Market scanning
-MAX_MARKETS = 100
-MAX_SIGNALS_PER_SCAN = 5
-REQUEST_TIMEOUT = 15
-REQUEST_DELAY = 0.15
+        except Exception as exc:
+            logger.warning(
+                "Markets endpoint failed: %s | %s",
+                path, type(exc).__name__
+            )
 
-# Telegram credentials are configured in GitHub Secrets
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    logger.error(
+        "Could not identify a working markets endpoint."
+    )
+    return []
 
-# -------------------- LOGGING --------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+def normalize_symbol(value):
+    """Normalize common market symbol representations."""
+    if not value:
+        return ""
 
-logger = logging.getLogger("ETH_WHALE")
+    symbol = str(value).upper().strip()
+    symbol = symbol.replace("/", "_").replace("-", "_")
 
-# -------------------- HTTP SESSION ----------------------------
+    return symbol
 
-SESSION = requests.Session()
 
-SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-PaperSignalBot/1.0",
-    "Accept": "application/json",
-})
+def is_usdt_market(symbol):
+    """Accept common USDT quote-symbol formats."""
+    symbol = normalize_symbol(symbol)
 
-# -------------------- SAFETY CHECK ----------------------------
-
-if REAL_ORDERS_ENABLED:
-    raise RuntimeError(
-        "Safety stop: this bot must never place real orders."
+    return (
+        symbol.endswith("_USDT")
+        or symbol.endswith("USDT")
     )
 
-if not PAPER_MODE:
-    raise RuntimeError(
-        "Safety stop: paper trading mode must remain enabled."
+
+def get_market_symbol(item):
+    """Read a symbol from a market object."""
+    if isinstance(item, str):
+        return normalize_symbol(item)
+
+    if not isinstance(item, dict):
+        return ""
+
+    market = (
+        item.get("symbol")
+        or item.get("code")
+        or item.get("name")
+        or item.get("market")
+        or item.get("pair")
+        or ""
     )
 
-
-def now_utc():
-    """Return current UTC time."""
-    return datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
+    return normalize_symbol(market)
 
 
-def log_status(message):
-    """Write a status message to the log."""
-    logger.info(message)
+def get_tickers():
+    """Retrieve public ticker data."""
+    endpoints = [
+        "/api/v1/mkt/tickers/",
+        "/api/v1/mkt/ticker/",
+    ]
+
+    for path in endpoints:
+        try:
+            data = get_json(BITPIN_BASE + path)
+            items = unwrap_data(data)
+
+            if items:
+                logger.info(
+                    "Ticker endpoint worked: %s (%s items)",
+                    path, len(items)
+                )
+                return items
+
+            logger.warning(
+                "Ticker response had no recognized data: %s",
+                path
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Ticker endpoint failed: %s | %s",
+                path, type(exc).__name__
+            )
+
+    logger.error("Could not retrieve ticker data.")
+    return []
 
 
-def get_json(url, params=None):
-    """Perform a read-only HTTP GET request."""
-    response = SESSION.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+def get_ticker_price(item):
+    """Read a last-traded price from common ticker fields."""
+    if not isinstance(item, dict):
+        return 0.0
+
+    for key in (
+        "price", "last", "last_price", "lastPrice",
+        "close", "last_traded_price"
+    ):
+        value = item.get(key)
+
+        try:
+            price = float(value)
+            if price > 0:
+                return price
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
 
 
-def telegram_send(text):
-    """Send a Telegram message if credentials are configured."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.warning(
-            "Telegram credentials missing; message not sent."
-        )
-        return False
+def build_valid_market_list(markets, tickers):
+    """Keep markets with a matching ticker and valid price."""
+    ticker_map = {}
 
-    url = (
-        f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage"
-    )
+    for item in tickers:
+        if not isinstance(item, dict):
+            continue
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+        symbol = get_market_symbol(item)
 
-    try:
-        response = SESSION.post(
-            url,
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
+        if symbol:
+            ticker_map[symbol] = item
 
-        result = response.json()
+    valid = []
+    seen = set()
 
-        if not result.get("ok"):
-            logger.error("Telegram API returned an error.")
-            return False
+    for market in markets:
+        symbol = get_market_symbol(market)
 
-        return True
+        if not symbol or not is_usdt_market(symbol):
+            continue
 
-    except requests.RequestException as exc:
-        logger.error("Telegram connection failed: %s", exc)
-        return False
+        if symbol in seen:
+            continue
+
+        ticker = ticker_map.get(symbol)
+
+        if ticker is None:
+            # Try matching alternate separators and formatting.
+            ticker = ticker_map.get(symbol.replace("_", ""))
+
+        if ticker is None:
+            continue
+
+        price = get_ticker_price(ticker)
+
+        if price <= 0:
+            continue
+
+        valid.append({
+            "symbol": symbol,
+            "price": price,
+            "ticker": ticker,
+        })
+
+        seen.add(symbol)
+
+    logger.info("Valid USDT markets with prices: %s", len(valid))
+
+    return valid
 
 
-def format_price(value):
-    """Format a price without unnecessary trailing zeros."""
-    try:
-        return f"{float(value):,.8f}".rstrip("0").rstrip(".")
-    except (TypeError, ValueError):
-        return str(value)
-
-
-# End of Part 1
-# Parts 2-5 will be added below this line.
+# End of Part 2
