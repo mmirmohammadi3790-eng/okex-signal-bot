@@ -1,623 +1,521 @@
 
 import os
-import json
 import time
-import base64
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
-from datetime import datetime, timezone
+
 
 # ============================================================
-# BITPIN PAPER SIGNAL BOT V2
-# PAPER ONLY - NO REAL EXCHANGE ORDERS
+# BITPIN PAPER SIGNAL BOT
+# PAPER TRADING ONLY - NO REAL ORDERS
 # ============================================================
 
-MARKET_BASE = "https://api.bitpin.ir"
-TRADE_BASE = "https://api.bitpin.market"
-TIMEOUT = 15
+BITPIN_BASE = "https://api.bitpin.ir"
 
-CAPITAL_USDT = 48.0
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Simulated trading settings
+CAPITAL_USDT = 100.0
 LEVERAGE = 3
 POSITION_USDT = CAPITAL_USDT * LEVERAGE
+PAPER_MODE = True
 
-MAX_MARKETS = 12
-MAX_ALERTS = 3
-MIN_TRADES = 30
-MIN_MOVE_PERCENT = 0.35
-MIN_DIRECTIONAL_RATIO = 0.58
+# Signal settings
+MAX_SIGNALS_PER_RUN = 3
+MAX_WORKERS = 6
+REQUEST_TIMEOUT = 12
+TRADES_TO_ANALYZE = 30
+
+MIN_CHANGE_PERCENT = 0.15
+MIN_DIRECTIONAL_CONSISTENCY = 60.0
 
 STOP_PERCENT = 0.80
-TP_PERCENTAGES = [0.80, 1.60, 2.40]
-COOLDOWN_HOURS = 6
+TP1_PERCENT = 0.80
+TP2_PERCENT = 1.60
+TP3_PERCENT = 2.40
 
-STATE_FILE = "bot_state.json"
+# Scan all markets quoted in USDT.
+# Set to a positive number to limit the scan if necessary.
+MAX_MARKETS = 0
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
-GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main")
-
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Bitpin-Paper-Signal-Bot/2.0"
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Bitpin-Paper-Signal-Bot/1.0",
+    "Accept": "application/json",
 })
 
 
-def now():
-    return int(time.time())
-
-
-def number(value, default=0.0):
-    try:
-        if isinstance(value, dict):
-            for key in ("price", "last", "value"):
-                if key in value:
-                    return float(value[key])
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
+# ============================================================
+# HTTP HELPERS
+# ============================================================
 
 def get_json(url, params=None):
-    response = session.get(
-        url, params=params, timeout=TIMEOUT
+    response = SESSION.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT
     )
     response.raise_for_status()
     return response.json()
 
 
+def extract_list(data):
+    """Handle common list response formats."""
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in (
+            "results",
+            "data",
+            "markets",
+            "trades",
+            "matches",
+            "tickers",
+        ):
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return value
+
+            if isinstance(value, dict):
+                for nested_key in ("results", "data", "items"):
+                    nested = value.get(nested_key)
+                    if isinstance(nested, list):
+                        return nested
+
+                # Some APIs return a symbol-keyed ticker dictionary.
+                if key == "tickers":
+                    return [
+                        dict(item, symbol=item.get("symbol", symbol))
+                        if isinstance(item, dict)
+                        else item
+                        for symbol, item in value.items()
+                    ]
+
+    return []
+
+
+def as_float(value):
+    try:
+        result = float(value)
+        if result > 0:
+            return result
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
+# ============================================================
+# MARKET DISCOVERY
+# ============================================================
+
+def get_usdt_markets():
+    url = f"{BITPIN_BASE}/v1/mkt/markets/"
+    data = get_json(url)
+    raw_markets = extract_list(data)
+
+    markets = []
+    seen = set()
+
+    for market in raw_markets:
+        if not isinstance(market, dict):
+            continue
+
+        symbol = str(
+            market.get("symbol")
+            or market.get("code")
+            or market.get("name")
+            or ""
+        ).strip().upper()
+
+        base = str(
+            market.get("base_currency")
+            or market.get("base")
+            or ""
+        ).strip().upper()
+
+        quote = str(
+            market.get("quote_currency")
+            or market.get("quote")
+            or ""
+        ).strip().upper()
+
+        if not symbol:
+            continue
+
+        # Common Bitpin market symbol format: BTC_USDT
+        is_usdt = (
+            symbol.endswith("_USDT")
+            or symbol.endswith("-USDT")
+            or quote == "USDT"
+        )
+
+        if not is_usdt:
+            continue
+
+        if symbol in seen:
+            continue
+
+        seen.add(symbol)
+
+        # Normalize the symbol for the recent-trades endpoint.
+        symbol = symbol.replace("-", "_")
+
+        markets.append({
+            "symbol": symbol,
+            "base": base,
+            "quote": quote or "USDT",
+        })
+
+    if MAX_MARKETS > 0:
+        markets = markets[:MAX_MARKETS]
+
+    return markets
+
+
+# ============================================================
+# RECENT TRADES
+# ============================================================
+
+def get_recent_trades(symbol):
+    url = (
+        f"{BITPIN_BASE}/api/v1/mth/"
+        f"matches/{symbol}/"
+    )
+
+    data = get_json(url)
+    rows = extract_list(data)
+
+    trades = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        price = as_float(row.get("price"))
+        if price is None:
+            continue
+
+        timestamp = (
+            row.get("time")
+            or row.get("timestamp")
+            or row.get("created_at")
+            or row.get("id")
+            or 0
+        )
+
+        trades.append({
+            "price": price,
+            "time": str(timestamp),
+        })
+
+    # Order trades chronologically when the API returns
+    # sortable timestamps or IDs.
+    trades.sort(key=lambda item: item["time"])
+
+    return trades[-TRADES_TO_ANALYZE:]
+
+
+# ============================================================
+# PAPER SIGNAL CALCULATION
+# ============================================================
+
+def analyze_market(market):
+    symbol = market["symbol"]
+
+    try:
+        trades = get_recent_trades(symbol)
+
+        if len(trades) < 10:
+            return None
+
+        prices = [trade["price"] for trade in trades]
+
+        first_price = prices[0]
+        last_price = prices[-1]
+
+        if first_price <= 0 or last_price <= 0:
+            return None
+
+        change_pct = (
+            (last_price - first_price) / first_price
+        ) * 100.0
+
+        if abs(change_pct) < MIN_CHANGE_PERCENT:
+            return None
+
+        if last_price > first_price:
+            direction = "LONG"
+            favorable_steps = sum(
+                1 for a, b in zip(prices, prices[1:])
+                if b > a
+            )
+        elif last_price < first_price:
+            direction = "SHORT"
+            favorable_steps = sum(
+                1 for a, b in zip(prices, prices[1:])
+                if b < a
+            )
+        else:
+            return None
+
+        total_steps = len(prices) - 1
+
+        if total_steps <= 0:
+            return None
+
+        consistency = (
+            favorable_steps / total_steps
+        ) * 100.0
+
+        if consistency < MIN_DIRECTIONAL_CONSISTENCY:
+            return None
+
+        # A simple heuristic score, not a probability of profit.
+        movement_score = min(
+            abs(change_pct) / 0.50,
+            1.0
+        ) * 40.0
+
+        score = round(
+            consistency * 0.60 + movement_score,
+            1
+        )
+
+        entry = last_price
+
+        if direction == "LONG":
+            stop = entry * (1 - STOP_PERCENT / 100)
+            tp1 = entry * (1 + TP1_PERCENT / 100)
+            tp2 = entry * (1 + TP2_PERCENT / 100)
+            tp3 = entry * (1 + TP3_PERCENT / 100)
+        else:
+            stop = entry * (1 + STOP_PERCENT / 100)
+            tp1 = entry * (1 - TP1_PERCENT / 100)
+            tp2 = entry * (1 - TP2_PERCENT / 100)
+            tp3 = entry * (1 - TP3_PERCENT / 100)
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry,
+            "stop": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "change_pct": change_pct,
+            "consistency": consistency,
+            "score": score,
+            "trades_count": len(trades),
+        }
+
+    except Exception as exc:
+        logging.warning("%s skipped: %s", symbol, exc)
+        return None
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("TELEGRAM CONFIGURATION MISSING")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error(
+            "Telegram configuration missing. "
+            "Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+        )
         return False
 
     url = (
         "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
+        f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
     try:
-        response = session.post(
+        response = requests.post(
             url,
-            data={
-                "chat_id": CHAT_ID,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
+                "disable_web_page_preview": True,
             },
-            timeout=TIMEOUT,
+            timeout=REQUEST_TIMEOUT,
         )
+
         response.raise_for_status()
-        print("TELEGRAM: SENT")
+        result = response.json()
+
+        if not result.get("ok"):
+            logging.error("Telegram API rejected the message.")
+            return False
+
+        logging.info("Telegram message sent.")
         return True
-    except requests.RequestException as error:
-        print("TELEGRAM ERROR:", str(error)[:250])
+
+    except Exception as exc:
+        logging.error("Telegram send failed: %s", exc)
         return False
 
 
-def state_url():
-    if not GITHUB_REPOSITORY or not GITHUB_TOKEN:
-        return None
+def format_price(value):
+    if value >= 100:
+        return f"{value:.4f}"
+    if value >= 1:
+        return f"{value:.6f}"
+    return f"{value:.8f}"
+
+
+def format_signal(signal, number):
+    direction_fa = (
+        "خرید آزمایشی LONG"
+        if signal["direction"] == "LONG"
+        else "فروش آزمایشی SHORT"
+    )
+
+    # Gross P/L estimates on the full simulated position.
+    tp1_pnl = POSITION_USDT * TP1_PERCENT / 100
+    tp2_pnl = POSITION_USDT * TP2_PERCENT / 100
+    tp3_pnl = POSITION_USDT * TP3_PERCENT / 100
+    stop_pnl = -POSITION_USDT * STOP_PERCENT / 100
 
     return (
-        "https://api.github.com/repos/"
-        + GITHUB_REPOSITORY
-        + "/contents/"
-        + STATE_FILE
+        f"📊 BITPIN PAPER SIGNAL #{number}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"جفت‌ارز: {signal['symbol']}\n"
+        f"جهت: {direction_fa}\n"
+        f"امتیاز الگوریتم: {signal['score']}/100\n"
+        f"تغییر قیمت معاملات اخیر: "
+        f"{signal['change_pct']:+.3f}%\n"
+        f"هم‌جهتی حرکت‌ها: "
+        f"{signal['consistency']:.1f}%\n"
+        f"تعداد معاملات بررسی‌شده: "
+        f"{signal['trades_count']}\n"
+        f"\n"
+        f"ورود فرضی: {format_price(signal['entry'])}\n"
+        f"حد ضرر: {format_price(signal['stop'])}\n"
+        f"TP1: {format_price(signal['tp1'])}\n"
+        f"TP2: {format_price(signal['tp2'])}\n"
+        f"TP3: {format_price(signal['tp3'])}\n"
+        f"\n"
+        f"سرمایه مجازی: {CAPITAL_USDT:.2f} USDT\n"
+        f"اهرم شبیه‌سازی: {LEVERAGE}x\n"
+        f"ارزش اسمی موقعیت: {POSITION_USDT:.2f} USDT\n"
+        f"\n"
+        f"سود ناخالص فرضی TP1: +{tp1_pnl:.2f} USDT\n"
+        f"سود ناخالص فرضی TP2: +{tp2_pnl:.2f} USDT\n"
+        f"سود ناخالص فرضی TP3: +{tp3_pnl:.2f} USDT\n"
+        f"زیان ناخالص فرضی SL: {stop_pnl:.2f} USDT\n"
+        f"\n"
+        f"⚠️ PAPER ONLY — سفارش واقعی ثبت نمی‌شود.\n"
+        f"این سیگنال بر اساس معاملات اخیر است، نه تأیید "
+        f"کندلی یا تضمین سود.\n"
+        f"کارمزد، لغزش قیمت و فاندینگ محاسبه نشده‌اند."
     )
 
 
-def github_headers():
-    return {
-        "Authorization": "Bearer " + GITHUB_TOKEN,
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+# ============================================================
+# MAIN
+# ============================================================
 
+def main():
+    logging.info("Starting Bitpin paper signal bot.")
+    logging.info(
+        "Capital=%.2f USDT | Leverage=%sx | Notional=%.2f USDT",
+        CAPITAL_USDT,
+        LEVERAGE,
+        POSITION_USDT,
+    )
 
-def empty_state():
-    return {
-        "last_alert": {},
-        "active": [],
-        "history": [],
-    }
-
-
-def load_state():
-    url = state_url()
-
-    if not url:
-        print("STATE: no GitHub token; using temporary state")
-        return empty_state(), None
-
-    try:
-        response = session.get(
-            url,
-            headers=github_headers(),
-            params={"ref": GITHUB_BRANCH},
-            timeout=TIMEOUT,
-        )
-
-        if response.status_code == 404:
-            print("STATE: file not created yet")
-            return empty_state(), None
-
-        response.raise_for_status()
-        item = response.json()
-
-        raw = base64.b64decode(
-            item["content"]
-        ).decode("utf-8")
-
-        state = json.loads(raw)
-        state.setdefault("last_alert", {})
-        state.setdefault("active", [])
-        state.setdefault("history", [])
-
-        print("STATE: loaded from GitHub")
-        return state, item["sha"]
-
-    except Exception as error:
-        print("STATE LOAD ERROR:", str(error)[:250])
+    if not PAPER_MODE:
         raise RuntimeError(
-            "Could not load saved state; stopping to avoid duplicates."
+            "Safety check failed: this bot must remain paper-only."
         )
 
-
-def save_state(state, sha):
-    url = state_url()
-
-    if not url:
-        print("STATE NOT SAVED: GitHub token is missing")
-        return False
-
-    content = json.dumps(
-        state, ensure_ascii=False, indent=2
-    )
-    encoded = base64.b64encode(
-        content.encode("utf-8")
-    ).decode("ascii")
-
-    payload = {
-        "message": "Update Bitpin paper signal state",
-        "content": encoded,
-        "branch": GITHUB_BRANCH,
-    }
-
-    if sha:
-        payload["sha"] = sha
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret."
+        )
 
     try:
-        response = session.put(
-            url,
-            headers=github_headers(),
-            json=payload,
-            timeout=TIMEOUT,
+        markets = get_usdt_markets()
+    except Exception as exc:
+        logging.error("Could not load Bitpin markets: %s", exc)
+        raise
+
+    logging.info("USDT markets discovered: %s", len(markets))
+
+    if not markets:
+        raise RuntimeError(
+            "No USDT markets found. Check the Bitpin markets response."
         )
-        response.raise_for_status()
-        print("STATE: saved to GitHub")
-        return True
 
-    except Exception as error:
-        print("STATE SAVE ERROR:", str(error)[:350])
-        return False
+    signals = []
+    completed = 0
 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(analyze_market, market): market
+            for market in markets
+        }
 
-def get_markets():
-    data = get_json(
-        MARKET_BASE + "/v1/mkt/markets/",
-        {"page": 1},
-    )
+        for future in as_completed(futures):
+            completed += 1
 
-    if isinstance(data, dict):
-        items = data.get("results", [])
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = []
+            try:
+                signal = future.result()
+                if signal:
+                    signals.append(signal)
+            except Exception as exc:
+                market = futures[future]
+                logging.warning(
+                    "Market analysis failed for %s: %s",
+                    market.get("symbol", "UNKNOWN"),
+                    exc,
+                )
 
-    markets = []
-
-    for item in items:
-        symbol = str(item.get("code", "")).upper()
-
-        if not symbol.endswith("_USDT"):
-            continue
-        if item.get("tradable") is False:
-            continue
-        if item.get("suspended") is True:
-            continue
-
-        markets.append({
-            "symbol": symbol,
-            "volume": number(item.get("volume_24h")),
-            "market_price": number(item.get("price")),
-        })
-
-    markets.sort(
-        key=lambda item: item["volume"],
+    signals.sort(
+        key=lambda item: (
+            item["score"],
+            item["consistency"],
+            abs(item["change_pct"]),
+        ),
         reverse=True,
     )
 
-    return markets[:MAX_MARKETS]
+    selected = signals[:MAX_SIGNALS_PER_RUN]
 
-
-def get_recent_trades(symbol):
-    url = (
-        TRADE_BASE
-        + "/api/v1/mth/matches/"
-        + symbol
-        + "/"
+    logging.info(
+        "Scan complete: %s markets checked, %s candidates found.",
+        completed,
+        len(signals),
     )
 
-    data = get_json(url)
-
-    if isinstance(data, dict):
-        data = data.get(
-            "results",
-            data.get("data", []),
+    if not selected:
+        message = (
+            "🔎 BITPIN PAPER BOT\n"
+            "بررسی بازار تمام شد.\n"
+            f"بازارهای USDT: {len(markets)}\n"
+            "در این اجرا سیگنالی با شرایط تعیین‌شده پیدا نشد.\n"
+            "سفارش واقعی: خاموش"
         )
-
-    if not isinstance(data, list):
-        return []
-
-    trades = []
-
-    for item in data:
-        price = number(item.get("price"))
-        stamp = number(item.get("time"), -1)
-
-        if price > 0:
-            trades.append({
-                "price": price,
-                "time": stamp,
-            })
-
-    if trades and all(t["time"] >= 0 for t in trades):
-        trades.sort(key=lambda item: item["time"])
-
-    return trades
-
-
-def analyze_trades(trades):
-    if len(trades) < MIN_TRADES:
-        return None
-
-    window = trades[-MIN_TRADES:]
-    prices = [item["price"] for item in window]
-
-    first_price = prices[0]
-    last_price = prices[-1]
-
-    if first_price <= 0 or last_price <= 0:
-        return None
-
-    move_pct = (
-        (last_price - first_price) / first_price
-    ) * 100
-
-    changes = [
-        prices[i] - prices[i - 1]
-        for i in range(1, len(prices))
-    ]
-
-    nonzero = [change for change in changes if change != 0]
-
-    if not nonzero:
-        return None
-
-    up_ratio = sum(change > 0 for change in nonzero) / len(nonzero)
-    down_ratio = sum(change < 0 for change in nonzero) / len(nonzero)
-
-    if (
-        move_pct >= MIN_MOVE_PERCENT
-        and up_ratio >= MIN_DIRECTIONAL_RATIO
-    ):
-        direction = "LONG"
-        ratio = up_ratio
-
-    elif (
-        move_pct <= -MIN_MOVE_PERCENT
-        and down_ratio >= MIN_DIRECTIONAL_RATIO
-    ):
-        direction = "SHORT"
-        ratio = down_ratio
-
-    else:
-        return None
-
-    return {
-        "direction": direction,
-        "move_pct": move_pct,
-        "ratio": ratio,
-        "trade_count": len(window),
-        "last_trade_price": last_price,
-    }
-
-
-def make_signal(symbol, analysis, current_price):
-    # Use the most recent observed trade as the entry reference.
-    entry = analysis["last_trade_price"]
-    direction = analysis["direction"]
-
-    if direction == "LONG":
-        stop = entry * (1 - STOP_PERCENT / 100)
-        targets = [
-            entry * (1 + pct / 100)
-            for pct in TP_PERCENTAGES
-        ]
-    else:
-        stop = entry * (1 + STOP_PERCENT / 100)
-        targets = [
-            entry * (1 - pct / 100)
-            for pct in TP_PERCENTAGES
-        ]
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "current_price": current_price,
-        "stop": stop,
-        "targets": targets,
-        "move_pct": analysis["move_pct"],
-        "ratio": analysis["ratio"],
-        "trade_count": analysis["trade_count"],
-        "created_at": now(),
-        "status": "OPEN",
-        "highest_tp": 0,
-    }
-
-
-def fmt_price(price):
-    if price >= 1000:
-        return f"{price:,.2f}"
-    if price >= 1:
-        return f"{price:.6f}".rstrip("0").rstrip(".")
-    return f"{price:.10f}".rstrip("0").rstrip(".")
-
-
-def signal_message(signal):
-    tp1, tp2, tp3 = signal["targets"]
-
-    pnl1 = POSITION_USDT * TP_PERCENTAGES[0] / 100
-    pnl2 = POSITION_USDT * TP_PERCENTAGES[1] / 100
-    pnl3 = POSITION_USDT * TP_PERCENTAGES[2] / 100
-    loss = POSITION_USDT * STOP_PERCENT / 100
-
-    return (
-        "BITPIN PAPER SIGNAL\n"
-        "REAL ORDERS: OFF\n\n"
-        f"Market: {signal['symbol']}\n"
-        f"Direction: {signal['direction']}\n"
-        "Signal: Recent-trade momentum (experimental)\n"
-        f"Observed price: {fmt_price(signal['current_price'])}\n"
-        f"Entry reference: {fmt_price(signal['entry'])}\n"
-        f"Stop reference: {fmt_price(signal['stop'])}\n"
-        f"TP1: {fmt_price(tp1)}\n"
-        f"TP2: {fmt_price(tp2)}\n"
-        f"TP3: {fmt_price(tp3)}\n\n"
-        f"Capital: {CAPITAL_USDT:.2f} USDT\n"
-        f"Simulated leverage: {LEVERAGE}x\n"
-        f"Position notional: {POSITION_USDT:.2f} USDT\n"
-        f"Gross TP1 estimate: +{pnl1:.3f} USDT\n"
-        f"Gross TP2 estimate: +{pnl2:.3f} USDT\n"
-        f"Gross TP3 estimate: +{pnl3:.3f} USDT\n"
-        f"Gross stop estimate: -{loss:.3f} USDT\n\n"
-        f"Recent price change: {signal['move_pct']:.3f}%\n"
-        f"Directional consistency: {signal['ratio']*100:.1f}%\n"
-        f"Trades analyzed: {signal['trade_count']}\n\n"
-        "Trade-flow only; no candle confirmation. "
-        "P/L excludes fees, slippage and funding. "
-        "No exchange orders were placed."
-    )
-
-
-def update_results(state, current_prices):
-    remaining = []
-
-    for signal in state["active"]:
-        symbol = signal["symbol"]
-        price = current_prices.get(symbol, 0)
-
-        if price <= 0:
-            remaining.append(signal)
-            continue
-
-        direction = signal["direction"]
-        stop = signal["stop"]
-        targets = signal["targets"]
-
-        # Conservative rule: stop takes priority if both
-        # stop and target levels are crossed between scans.
-        stop_hit = (
-            price <= stop if direction == "LONG"
-            else price >= stop
-        )
-
-        if stop_hit:
-            signal["status"] = "STOP_OBSERVED"
-            signal["exit_price"] = price
-            signal["closed_at"] = now()
-            state["history"].append(signal)
-
-            print(
-                "RESULT:", symbol,
-                "STOP OBSERVED at", fmt_price(price)
-            )
-
-            send_telegram(
-                "PAPER RESULT - SIMULATED\n"
-                f"Market: {symbol}\n"
-                f"Direction: {direction}\n"
-                "Stop level crossed by an observed trade price.\n"
-                f"Observed price: {fmt_price(price)}\n"
-                "No real order was executed."
-            )
-            continue
-
-        reached = 0
-
-        for index, target in enumerate(targets, start=1):
-            target_hit = (
-                price >= target if direction == "LONG"
-                else price <= target
-            )
-            if target_hit:
-                reached = index
-
-        previous = signal.get("highest_tp", 0)
-
-        if reached > previous:
-            signal["highest_tp"] = reached
-
-            print(
-                "RESULT:", symbol,
-                f"TP{reached} OBSERVED at",
-                fmt_price(price),
-            )
-
-            send_telegram(
-                "PAPER RESULT UPDATE - SIMULATED\n"
-                f"Market: {symbol}\n"
-                f"Direction: {direction}\n"
-                f"TP{reached} level crossed.\n"
-                f"Observed price: {fmt_price(price)}\n"
-                "No real order was executed."
-            )
-
-        if reached >= 3:
-            signal["status"] = "TP3_OBSERVED"
-            signal["exit_price"] = price
-            signal["closed_at"] = now()
-            state["history"].append(signal)
-            continue
-
-        remaining.append(signal)
-
-    state["active"] = remaining
-    state["history"] = state["history"][-500:]
-
-
-def main():
-    print("=" * 55)
-    print("BITPIN PAPER SIGNAL BOT V2")
-    print("UTC:", datetime.now(timezone.utc).isoformat())
-    print("REAL ORDERS: OFF")
-    print("CAPITAL:", CAPITAL_USDT, "USDT")
-    print("LEVERAGE:", LEVERAGE, "x")
-    print("=" * 55)
-
-    state, sha = load_state()
-
-    try:
-        markets = get_markets()
-    except Exception as error:
-        print("MARKET FETCH ERROR:", str(error)[:300])
+        send_telegram(message)
         return
 
-    print("MARKETS SELECTED:", len(markets))
+    for index, signal in enumerate(selected, start=1):
+        send_telegram(format_signal(signal, index))
+        time.sleep(1)
 
-    current_prices = {}
-    candidates = []
-
-    for market in markets:
-        symbol = market["symbol"]
-
-        try:
-            trades = get_recent_trades(symbol)
-
-            # Recent trade is the primary observed price.
-            # Fall back to market-list price if no trades exist.
-            last_trade_price = (
-                trades[-1]["price"] if trades else 0
-            )
-            current_price = (
-                last_trade_price or market["market_price"]
-            )
-
-            if current_price > 0:
-                current_prices[symbol] = current_price
-
-            analysis = analyze_trades(trades)
-
-            print(
-                f"{symbol}: price="
-                f"{fmt_price(current_price) if current_price else 'N/A'}; "
-                f"trades={len(trades)}; "
-                f"{analysis['direction'] if analysis else 'WAIT'}"
-            )
-
-            candidates.append(
-                (symbol, analysis, current_price)
-            )
-
-        except Exception as error:
-            print(
-                symbol,
-                "FETCH ERROR:",
-                str(error)[:200],
-            )
-
-        time.sleep(0.25)
-
-    # Evaluate old signals using prices observed in this scan.
-    update_results(state, current_prices)
-
-    active_symbols = {
-        item["symbol"] for item in state["active"]
-    }
-    alerts = 0
-
-    for symbol, analysis, current_price in candidates:
-        if not analysis or current_price <= 0:
-            continue
-
-        # Do not open another paper signal for a market
-        # while its previous signal remains active.
-        if symbol in active_symbols:
-            print(symbol, "SKIP: signal already active")
-            continue
-
-        key = symbol + ":" + analysis["direction"]
-        last_alert = int(state["last_alert"].get(key, 0))
-
-        if now() - last_alert < COOLDOWN_HOURS * 3600:
-            print(symbol, "SKIP: cooldown")
-            continue
-
-        signal = make_signal(
-            symbol, analysis, current_price
-        )
-
-        # Persist signal and cooldown before sending the alert.
-        state["active"].append(signal)
-        state["last_alert"][key] = now()
-        active_symbols.add(symbol)
-
-        message = signal_message(signal)
-        print("\n" + message + "\n")
-
-        send_telegram(message)
-        alerts += 1
-
-        if alerts >= MAX_ALERTS:
-            break
-
-    saved = save_state(state, sha)
-
-    print("=" * 55)
-    print("MARKETS CHECKED:", len(candidates))
-    print("NEW ALERTS:", alerts)
-    print("ACTIVE SIGNALS:", len(state["active"]))
-    print("RECORDED RESULTS:", len(state["history"]))
-    print("STATE SAVED:", saved)
-    print("REAL ORDERS: OFF")
-    print("DONE")
+    logging.info("Bot finished. Real orders were not placed.")
 
 
 if __name__ == "__main__":
