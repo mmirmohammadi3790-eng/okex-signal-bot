@@ -1,10 +1,10 @@
 
 # ============================================================
-# ETH WHALE | BITPIN SMART MARKET WATCH
+# ETH WHALE - BITPIN SMART MARKET WATCH V4
 # PAPER SIGNALS ONLY - NO REAL ORDERS
-# Capital: 48 USDT | Simulated leverage: 3x
+# Capital: 48 USDT | Leverage: 3x | Max signals: 3
 # Timeframes: 15m + 1h
-# Indicators: EMA20 / EMA50 / RSI14 / Volume / ATR
+# EMA20/EMA50 | RSI14 | Volume | ATR | Risk Management
 # ============================================================
 
 import os
@@ -15,37 +15,40 @@ from datetime import datetime, timezone
 import requests
 
 
-# ---------------------- CONFIGURATION -----------------------
+# ---------------- CONFIG ----------------
 
-BOT_NAME = "🐋 ETH WHALE"
-
+BOT_NAME = "ETH WHALE"
 BITPIN_BASE = "https://api.bitpin.org"
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 CAPITAL = 48.0
 LEVERAGE = 3
-PAPER_MODE = True
-
-MAX_MARKETS = 30
 MAX_SIGNALS = 3
-MIN_SCORE = 55
-STRONG_SCORE = 72
+MAX_MARKETS = 30
+
+MIN_SCORE = 65
+STRONG_SCORE = 80
+
+MIN_VOLUME_RATIO = 1.15
+MIN_RSI_LONG = 38
+MAX_RSI_LONG = 68
+MIN_RSI_SHORT = 32
+MAX_RSI_SHORT = 62
 
 CANDLE_LIMIT = 100
-TIMEFRAMES = ("15m", "1h")
+TIMEOUT = 12
+PAUSE = 0.15
 
-REQUEST_TIMEOUT = 12
-REQUEST_PAUSE = 0.15
-
-BINANCE_HOSTS = [
+CANDLE_HOSTS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
 ]
 
 HEADERS = {
-    "User-Agent": "ETH-WHALE-PaperBot/3.0",
+    "User-Agent": "ETH-WHALE-PaperBot/4.0",
     "Accept": "application/json",
 }
 
@@ -58,81 +61,64 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 
-# ---------------------- HTTP HELPERS ------------------------
+# ---------------- HTTP ----------------
 
 def get_json(url, params=None):
     response = session.get(
         url,
         params=params,
-        timeout=REQUEST_TIMEOUT,
+        timeout=TIMEOUT,
     )
     response.raise_for_status()
     return response.json()
 
 
-def first_value(data, keys, default=None):
-    if not isinstance(data, dict):
-        return default
-
-    for key in keys:
-        value = data.get(key)
-        if value is not None:
-            return value
-
-    return default
-
-
-# ---------------------- BITPIN MARKETS ----------------------
+# ---------------- BITPIN MARKETS ----------------
 
 def fetch_markets():
-    endpoints = [
+    urls = [
         f"{BITPIN_BASE}/v1/mkt/markets/",
         f"{BITPIN_BASE}/api/v1/mkt/markets/",
     ]
 
-    last_error = None
+    errors = []
 
-    for url in endpoints:
+    for url in urls:
         try:
             data = get_json(url)
 
             if isinstance(data, list):
                 rows = data
             elif isinstance(data, dict):
-                rows = data.get("results")
-                if not isinstance(rows, list):
-                    rows = data.get("markets")
-                if not isinstance(rows, list):
-                    rows = data.get("data")
+                rows = None
+                for key in ("results", "markets", "data"):
+                    if isinstance(data.get(key), list):
+                        rows = data[key]
+                        break
             else:
                 rows = None
 
-            if isinstance(rows, list) and rows:
-                logging.info("Bitpin markets loaded: %s", len(rows))
+            if rows:
+                logging.info("MARKETS OK: %d", len(rows))
                 return rows
 
-            last_error = f"Unexpected market response: {str(data)[:200]}"
+            errors.append(f"{url}: unexpected response")
 
         except Exception as exc:
-            last_error = f"{url}: {exc}"
-            logging.warning("Markets endpoint failed: %s", last_error)
+            errors.append(f"{url}: {exc}")
 
-    raise RuntimeError(
-        "Could not fetch Bitpin markets. " + str(last_error)
-    )
+    raise RuntimeError("Markets API failed: " + " | ".join(errors))
 
-
-# ---------------------- BITPIN TICKERS ----------------------
 
 def fetch_tickers():
-    endpoints = [
+    urls = [
         f"{BITPIN_BASE}/v1/mkt/tickers/",
         f"{BITPIN_BASE}/api/v1/mkt/tickers/",
     ]
 
-    last_error = None
+    errors = []
 
-    for url in endpoints:
+    for url in urls:
         try:
             data = get_json(url)
 
@@ -141,144 +127,139 @@ def fetch_tickers():
 
             if isinstance(data, dict):
                 for key in ("tickers", "results", "data"):
-                    rows = data.get(key)
-                    if isinstance(rows, list):
-                        return rows
-                    if isinstance(rows, dict):
-                        return [
-                            dict(value, symbol=value.get("symbol", key))
-                            if isinstance(value, dict)
-                            else {"symbol": key, "price": value}
-                            for key, value in rows.items()
-                        ]
+                    value = data.get(key)
 
-            last_error = f"Unexpected ticker response: {str(data)[:200]}"
+                    if isinstance(value, list):
+                        return value
+
+                    if isinstance(value, dict):
+                        rows = []
+                        for symbol, ticker in value.items():
+                            if isinstance(ticker, dict):
+                                item = dict(ticker)
+                                item.setdefault("symbol", symbol)
+                                rows.append(item)
+                        if rows:
+                            return rows
+
+            errors.append(f"{url}: unexpected response")
 
         except Exception as exc:
-            last_error = f"{url}: {exc}"
-            logging.warning("Ticker endpoint failed: %s", last_error)
+            errors.append(f"{url}: {exc}")
 
-    raise RuntimeError(
-        "Could not fetch Bitpin tickers. " + str(last_error)
-    )
+    raise RuntimeError("Tickers API failed: " + " | ".join(errors))
 
 
-def market_symbol(row):
+def get_symbol(row):
     if not isinstance(row, dict):
         return ""
 
-    symbol = first_value(
-        row,
-        ("symbol", "code", "market", "name"),
-        "",
-    )
+    for key in ("symbol", "code", "market", "name"):
+        value = row.get(key)
+        if value:
+            return str(value).strip().upper().replace("-", "_")
 
-    return str(symbol).upper().strip()
+    return ""
 
 
-def is_usdt_market(symbol):
-    symbol = symbol.upper().replace("-", "_")
+def is_usdt_symbol(symbol):
     return symbol.endswith("_USDT") or symbol.endswith("USDT")
 
 
-def market_is_tradable(row):
+def ticker_price(row):
     if not isinstance(row, dict):
-        return False
+        return None
 
-    for key in ("tradable", "is_active", "active", "is_trading"):
-        if key in row and row[key] is False:
-            return False
+    for key in ("price", "last", "last_price", "close", "lastPrice"):
+        try:
+            value = float(row[key])
+            if value > 0:
+                return value
+        except (KeyError, TypeError, ValueError):
+            continue
 
-    return True
+    return None
 
 
-def normalize_tickers(rows):
+def build_ticker_map(rows):
     result = {}
 
     for row in rows:
         if not isinstance(row, dict):
             continue
 
-        symbol = market_symbol(row)
-        price = first_value(
-            row,
-            ("price", "last", "last_price", "close", "lastPrice"),
-        )
+        symbol = get_symbol(row)
+        price = ticker_price(row)
 
-        try:
-            price = float(price)
-        except (TypeError, ValueError):
-            continue
-
-        if symbol and price > 0:
-            result[symbol.replace("-", "_")] = {
-                "price": price,
-                "raw": row,
-            }
+        if symbol and price:
+            result[symbol] = row
+            result[symbol.replace("_", "")] = row
 
     return result
 
 
-def get_market_price(symbol, ticker_map):
-    normalized = symbol.replace("-", "_").upper()
+def get_price(symbol, ticker_map):
+    row = ticker_map.get(symbol)
+    if row is None:
+        row = ticker_map.get(symbol.replace("_", ""))
 
-    if normalized in ticker_map:
-        return ticker_map[normalized]["price"]
-
-    compact = normalized.replace("_", "")
-
-    for key, value in ticker_map.items():
-        if key.replace("_", "") == compact:
-            return value["price"]
-
-    return None
+    return ticker_price(row) if row else None
 
 
-# ---------------------- CANDLE DATA -------------------------
-# Historical candles are retrieved from Binance public API.
-# The bot uses Bitpin for current market prices.
-# A candle-source failure is logged and never treated as a signal.
+def get_volume(row):
+    if not isinstance(row, dict):
+        return 0.0
 
-def to_binance_symbol(symbol):
-    return (
-        str(symbol)
-        .upper()
-        .replace("_", "")
-        .replace("-", "")
-        .replace("/", "")
-        .strip()
-    )
+    for key in (
+        "quote_volume",
+        "quoteVolume",
+        "quoteVolume24h",
+        "volume",
+        "base_volume",
+        "baseVolume",
+    ):
+        try:
+            value = float(row[key])
+            if value >= 0:
+                return value
+        except (KeyError, TypeError, ValueError):
+            continue
 
+    return 0.0
+
+
+# ---------------- CANDLES ----------------
+# Candle source: Binance public API.
+# Price source: Bitpin.
+# No real orders are placed.
 
 def fetch_candles(symbol, timeframe):
-    binance_symbol = to_binance_symbol(symbol)
+    binance_symbol = symbol.replace("_", "").replace("-", "")
     errors = []
 
-    for host in BINANCE_HOSTS:
-        url = host + "/api/v3/klines"
-
+    for host in CANDLE_HOSTS:
         try:
             response = session.get(
-                url,
+                host + "/api/v3/klines",
                 params={
                     "symbol": binance_symbol,
                     "interval": timeframe,
                     "limit": CANDLE_LIMIT,
                 },
-                timeout=REQUEST_TIMEOUT,
+                timeout=TIMEOUT,
             )
 
             if response.status_code != 200:
                 errors.append(
-                    f"{host}: HTTP {response.status_code} "
-                    f"{response.text[:120]}"
+                    f"{host} HTTP {response.status_code}: "
+                    f"{response.text[:100]}"
                 )
                 continue
 
             data = response.json()
 
             if not isinstance(data, list):
-                errors.append(f"{host}: unexpected response format")
+                errors.append(f"{host}: response is not a list")
                 continue
 
             candles = []
@@ -295,111 +276,110 @@ def fetch_candles(symbol, timeframe):
                         "close": float(row[4]),
                         "volume": float(row[5]),
                     })
-                except (TypeError, ValueError):
+                except (ValueError, TypeError):
                     continue
 
             if len(candles) >= 52:
                 logging.info(
-                    "CANDLES OK | %s | %s | count=%s | host=%s",
+                    "CANDLES OK | %s | %s | %d",
                     symbol,
                     timeframe,
                     len(candles),
-                    host,
                 )
-                return candles[-CANDLE_LIMIT:]
+                return candles
 
             errors.append(
-                f"{host}: only {len(candles)} valid candles"
+                f"{host}: only {len(candles)} candles"
             )
 
         except Exception as exc:
             errors.append(f"{host}: {repr(exc)}")
 
     logging.error(
-        "CANDLES FAILED | symbol=%s | timeframe=%s | %s",
+        "CANDLES FAILED | %s | %s | %s",
         symbol,
         timeframe,
-        " || ".join(errors)[:700],
+        " || ".join(errors)[:600],
     )
 
     return []
 
 
-# ---------------------- INDICATORS --------------------------
+# ---------------- INDICATORS ----------------
 
 def ema_series(values, period):
     if len(values) < period:
         return []
 
-    multiplier = 2.0 / (period + 1.0)
-    result = [None] * (period - 1)
-
+    multiplier = 2.0 / (period + 1)
     current = sum(values[:period]) / period
-    result.append(current)
+    result = [None] * (period - 1) + [current]
 
     for value in values[period:]:
-        current = value * multiplier + current * (1 - multiplier)
+        current = (
+            value * multiplier
+            + current * (1 - multiplier)
+        )
         result.append(current)
 
     return result
 
 
-def rsi_value(closes, period=14):
+def calculate_rsi(closes, period=14):
     if len(closes) <= period:
         return None
 
-    gains = []
-    losses = []
+    changes = [
+        closes[i] - closes[i - 1]
+        for i in range(1, len(closes))
+    ]
 
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    for i in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
 
     if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
+        return 100.0 if avg_gain else 50.0
 
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - 100 / (1 + rs)
 
 
-def atr_value(candles, period=14):
+def calculate_atr(candles, period=14):
     if len(candles) <= period:
         return None
 
-    true_ranges = []
+    ranges = []
 
     for i in range(1, len(candles)):
-        current = candles[i]
+        candle = candles[i]
         previous_close = candles[i - 1]["close"]
 
-        true_range = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close),
-        )
+        ranges.append(max(
+            candle["high"] - candle["low"],
+            abs(candle["high"] - previous_close),
+            abs(candle["low"] - previous_close),
+        ))
 
-        true_ranges.append(true_range)
+    atr = sum(ranges[:period]) / period
 
-    if len(true_ranges) < period:
-        return None
-
-    atr = sum(true_ranges[:period]) / period
-
-    for value in true_ranges[period:]:
+    for value in ranges[period:]:
         atr = (atr * (period - 1) + value) / period
 
     return atr
 
 
-def analyze_timeframe(candles):
+def analyze_candles(candles):
     if len(candles) < 52:
         return None
 
@@ -408,31 +388,28 @@ def analyze_timeframe(candles):
 
     ema20 = ema_series(closes, 20)
     ema50 = ema_series(closes, 50)
-    rsi = rsi_value(closes)
-    atr = atr_value(candles)
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles)
 
     if (
         not ema20
         or not ema50
         or rsi is None
         or atr is None
-        or ema20[-1] is None
-        or ema50[-1] is None
     ):
         return None
 
-    avg_volume = sum(volumes[-21:-1]) / 20.0
-    current_volume = volumes[-1]
-
+    avg_volume = sum(volumes[-21:-1]) / 20
     volume_ratio = (
-        current_volume / avg_volume if avg_volume > 0 else 0.0
+        volumes[-1] / avg_volume
+        if avg_volume > 0 else 0
     )
 
     close = closes[-1]
 
-    if ema20[-1] > ema50[-1] and close > ema20[-1]:
+    if close > ema20[-1] > ema50[-1]:
         trend = "LONG"
-    elif ema20[-1] < ema50[-1] and close < ema20[-1]:
+    elif close < ema20[-1] < ema50[-1]:
         trend = "SHORT"
     else:
         trend = "NEUTRAL"
@@ -448,119 +425,118 @@ def analyze_timeframe(candles):
     }
 
 
-# ---------------------- SIGNAL ENGINE ----------------------
+# ---------------- SIGNAL ENGINE ----------------
 
-def create_signal(symbol, price, analysis15, analysis1h):
-    if not analysis15 or not analysis1h or price <= 0:
+def make_signal(symbol, price, a15, a1h):
+    if not a15 or not a1h or price <= 0:
         return None
 
-    score_long = 0
-    score_short = 0
-    reasons_long = []
-    reasons_short = []
+    # Both timeframes must agree.
+    direction = a15["trend"]
 
-    # 15-minute trend
-    if analysis15["trend"] == "LONG":
-        score_long += 25
-        reasons_long.append("روند ۱۵دقیقه صعودی")
+    if direction not in ("LONG", "SHORT"):
+        return None
 
-    elif analysis15["trend"] == "SHORT":
-        score_short += 25
-        reasons_short.append("روند ۱۵دقیقه نزولی")
+    if a1h["trend"] != direction:
+        return None
 
-    # 1-hour trend
-    if analysis1h["trend"] == "LONG":
-        score_long += 30
-        reasons_long.append("روند ۱ساعته صعودی")
+    # Mandatory volume filter.
+    if a15["volume_ratio"] < MIN_VOLUME_RATIO:
+        return None
 
-    elif analysis1h["trend"] == "SHORT":
-        score_short += 30
-        reasons_short.append("روند ۱ساعته نزولی")
+    rsi15 = a15["rsi"]
+    rsi1h = a1h["rsi"]
 
-    # RSI confirmation
-    rsi15 = analysis15["rsi"]
-    rsi1h = analysis1h["rsi"]
+    if direction == "LONG":
+        if not (MIN_RSI_LONG <= rsi15 <= MAX_RSI_LONG):
+            return None
+        if rsi1h <= 50:
+            return None
+        if rsi15 < 45:
+            return None
 
-    if 50 <= rsi15 <= 68:
-        score_long += 15
-        reasons_long.append("RSI تایید خرید")
-
-    if 32 <= rsi15 <= 50:
-        score_short += 15
-        reasons_short.append("RSI تایید فروش")
-
-    if rsi1h > 50:
-        score_long += 10
-
-    elif rsi1h < 50:
-        score_short += 10
-
-    # Volume confirmation
-    volume_ratio = analysis15["volume_ratio"]
-
-    if volume_ratio >= 1.15:
-        if score_long > score_short:
-            score_long += 15
-            reasons_long.append("حجم بالاتر از میانگین")
-        elif score_short > score_long:
-            score_short += 15
-            reasons_short.append("حجم بالاتر از میانگین")
-
-    # Candle direction confirmation
-    if analysis15["close"] > analysis15["ema20"]:
-        score_long += 5
-    elif analysis15["close"] < analysis15["ema20"]:
-        score_short += 5
-
-    if score_long >= score_short:
-        direction = "LONG"
-        score = score_long
-        reasons = reasons_long
-        atr = analysis15["atr"]
     else:
-        direction = "SHORT"
-        score = score_short
-        reasons = reasons_short
-        atr = analysis15["atr"]
+        if not (MIN_RSI_SHORT <= rsi15 <= MAX_RSI_SHORT):
+            return None
+        if rsi1h >= 50:
+            return None
+        if rsi15 > 55:
+            return None
 
-    # Require agreement between timeframes.
-    if analysis15["trend"] != direction:
+    score = 0
+    reasons = []
+
+    # Trend agreement.
+    score += 30
+    reasons.append("تأیید روند در هر دو تایم‌فریم")
+
+    # EMA separation.
+    if direction == "LONG":
+        separation = (
+            a15["ema20"] - a15["ema50"]
+        ) / a15["ema50"] * 100
+
+    else:
+        separation = (
+            a15["ema50"] - a15["ema20"]
+        ) / a15["ema50"] * 100
+
+    if separation > 0.10:
+        score += 15
+        reasons.append("فاصله مناسب EMA")
+
+    # RSI strength.
+    if direction == "LONG" and 50 <= rsi15 <= 65:
+        score += 15
+        reasons.append("RSI مناسب خرید")
+
+    elif direction == "SHORT" and 35 <= rsi15 <= 50:
+        score += 15
+        reasons.append("RSI مناسب فروش")
+
+    # Volume confirmation is mandatory above.
+    score += 20
+    reasons.append("حجم حداقل 1.15 برابر میانگین")
+
+    # Hourly RSI confirmation.
+    if direction == "LONG" and rsi1h >= 55:
+        score += 10
+    elif direction == "SHORT" and rsi1h <= 45:
+        score += 10
+
+    # 15-minute candle agrees with direction.
+    if direction == "LONG" and a15["close"] > a15["ema20"]:
+        score += 10
+    elif direction == "SHORT" and a15["close"] < a15["ema20"]:
+        score += 10
+
+    if score < MIN_SCORE:
         return None
 
-    if analysis1h["trend"] != direction:
+    atr = a15["atr"]
+
+    if atr <= 0:
         return None
 
-    # Avoid buying an overbought market or selling an oversold market.
-    if direction == "LONG" and rsi15 >= 70:
-        return None
+    # Divide the simulated capital between up to 3 signals.
+    margin_per_signal = CAPITAL / MAX_SIGNALS
+    notional = margin_per_signal * LEVERAGE
+    quantity = notional / price
 
-    if direction == "SHORT" and rsi15 <= 30:
-        return None
-
-    if score < MIN_SCORE or atr <= 0:
-        return None
-
-    # Paper-only entry/stop/targets. No orders are sent.
     stop_distance = 1.5 * atr
-    tp1_distance = 1.5 * atr
-    tp2_distance = 2.2 * atr
-    tp3_distance = 3.0 * atr
 
     if direction == "LONG":
         stop = price - stop_distance
-        tp1 = price + tp1_distance
-        tp2 = price + tp2_distance
-        tp3 = price + tp3_distance
+        tp1 = price + 1.5 * atr
+        tp2 = price + 2.2 * atr
+        tp3 = price + 3.0 * atr
     else:
         stop = price + stop_distance
-        tp1 = price - tp1_distance
-        tp2 = price - tp2_distance
-        tp3 = price - tp3_distance
+        tp1 = price - 1.5 * atr
+        tp2 = price - 2.2 * atr
+        tp3 = price - 3.0 * atr
 
-    # Simulated exposure only; this does not place an exchange order.
-    position_notional = CAPITAL * LEVERAGE / max(1, MAX_SIGNALS)
-    estimated_quantity = position_notional / price
-    risk_estimate = estimated_quantity * stop_distance
+    estimated_loss = quantity * stop_distance
 
     return {
         "symbol": symbol,
@@ -573,17 +549,17 @@ def create_signal(symbol, price, analysis15, analysis1h):
         "tp3": tp3,
         "rsi15": rsi15,
         "rsi1h": rsi1h,
-        "volume_ratio": volume_ratio,
-        "position_notional": position_notional,
-        "risk_estimate": risk_estimate,
+        "volume_ratio": a15["volume_ratio"],
+        "margin": margin_per_signal,
+        "notional": notional,
+        "loss": estimated_loss,
         "reasons": reasons,
-        "strong": score >= STRONG_SCORE,
     }
 
 
-# ---------------------- FORMATTING -------------------------
+# ---------------- TELEGRAM FORMAT ----------------
 
-def fmt_price(value):
+def fmt(value):
     if value >= 1000:
         return f"{value:,.2f}"
     if value >= 1:
@@ -591,11 +567,11 @@ def fmt_price(value):
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
-def fmt_score(value):
-    return f"{int(value)}/100"
+def make_message(selected, analyzed, failed, signals):
+    now = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
 
-
-def build_message(markets_count, analyzed, errors, signals, run_time):
     lines = [
         "🐋 <b>ETH WHALE</b>",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -605,92 +581,85 @@ def build_message(markets_count, analyzed, errors, signals, run_time):
         "━━━━━━━━━━━━━━━━━━━━",
         f"💰 سرمایه آزمایشی: <b>{CAPITAL:.2f} USDT</b>",
         f"⚙️ اهرم شبیه‌سازی: <b>{LEVERAGE}x</b>",
-        f"📦 ارزش فرضی کل: <b>{CAPITAL * LEVERAGE:.2f} USDT</b>",
+        f"📦 ارزش فرضی هر موقعیت: <b>{CAPITAL / MAX_SIGNALS * LEVERAGE:.2f} USDT</b>",
         "⏱ تایم‌فریم: <b>15m + 1h</b>",
         "📈 قیمت لحظه‌ای: Bitpin",
         "🕯 کندل‌ها: Binance public API",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🔎 بازارهای انتخاب‌شده: <b>{markets_count}</b>",
+        f"🔎 بازارهای انتخاب‌شده: <b>{selected}</b>",
         f"✅ تحلیل موفق: <b>{analyzed}</b>",
-        f"⚠️ بازارهای دارای خطای کندل: <b>{errors}</b>",
+        f"⚠️ خطای کندل/تحلیل: <b>{failed}</b>",
         f"🎯 سیگنال معتبر: <b>{len(signals)}</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
     ]
 
     if analyzed == 0:
-        lines.extend([
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━",
             "🚨 <b>تحلیل انجام نشد</b>",
-            "داده کندل دریافت نشده است؛ سیگنال صادر نمی‌شود.",
-            "برای رفع مشکل، گزارش CANDLES FAILED را در GitHub Actions بررسی کنید.",
-        ])
+            "دریافت کندل ناموفق بوده است؛ سیگنال صادر نشد.",
+        ]
 
     elif not signals:
-        lines.append("🔍 در این اسکن سیگنال منطبق با فیلترها پیدا نشد.")
-        lines.append("برای جلوگیری از سیگنال ضعیف، فیلترها عمداً حفظ شده‌اند.")
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "🔍 سیگنال منطبق با فیلترهای جدید پیدا نشد.",
+            "فیلتر حجم و RSI اجباری است.",
+        ]
 
-    for index, signal in enumerate(signals, start=1):
-        direction_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
-        quality = "⭐ قوی" if signal["strong"] else "🔹 متعادل"
+    for i, s in enumerate(signals, 1):
+        emoji = "🟢" if s["direction"] == "LONG" else "🔴"
+        quality = "⭐ قوی" if s["score"] >= STRONG_SCORE else "🔹 متعادل"
 
-        lines.extend([
+        lines += [
             "",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"{direction_emoji} <b>سیگنال {index}: {signal['symbol']}</b>",
-            f"📍 جهت: <b>{signal['direction']}</b> | {quality}",
-            f"🧠 امتیاز: <b>{fmt_score(signal['score'])}</b>",
-            f"💵 ورود فرضی: <code>{fmt_price(signal['price'])}</code>",
-            f"🛑 حد ضرر: <code>{fmt_price(signal['stop'])}</code>",
-            f"🎯 TP1: <code>{fmt_price(signal['tp1'])}</code>",
-            f"🎯 TP2: <code>{fmt_price(signal['tp2'])}</code>",
-            f"🎯 TP3: <code>{fmt_price(signal['tp3'])}</code>",
-            f"📊 RSI 15m: {signal['rsi15']:.1f}",
-            f"📊 RSI 1h: {signal['rsi1h']:.1f}",
-            f"🔊 حجم نسبت به میانگین: {signal['volume_ratio']:.2f}x",
-            f"📦 سهم فرضی هر سیگنال: {signal['position_notional']:.2f} USDT",
-            f"⚠️ زیان تخمینی تا SL: {signal['risk_estimate']:.3f} USDT",
-            "📝 دلایل: " + "، ".join(signal["reasons"]),
-            "⚠️ سیگنال آزمایشی است؛ سود تضمین‌شده نیست.",
-        ])
+            f"{emoji} <b>سیگنال {i}: {s['symbol']}</b>",
+            f"📍 جهت: <b>{s['direction']}</b> | {quality}",
+            f"🧠 امتیاز: <b>{s['score']}/100</b>",
+            f"💵 ورود فرضی: <code>{fmt(s['price'])}</code>",
+            f"🛑 حد ضرر: <code>{fmt(s['stop'])}</code>",
+            f"🎯 TP1: <code>{fmt(s['tp1'])}</code>",
+            f"🎯 TP2: <code>{fmt(s['tp2'])}</code>",
+            f"🎯 TP3: <code>{fmt(s['tp3'])}</code>",
+            f"📊 RSI 15m: {s['rsi15']:.1f}",
+            f"📊 RSI 1h: {s['rsi1h']:.1f}",
+            f"🔊 حجم: {s['volume_ratio']:.2f}x میانگین",
+            f"💰 مارجین فرضی: {s['margin']:.2f} USDT",
+            f"📦 ارزش موقعیت: {s['notional']:.2f} USDT",
+            f"⚠️ زیان تخمینی تا SL: {s['loss']:.3f} USDT",
+            "📝 " + "، ".join(s["reasons"]),
+            "⚠️ آزمایشی است؛ سود تضمین‌شده نیست.",
+        ]
 
-    lines.extend([
+    lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"🕒 زمان اجرا: {run_time}",
+        f"🕒 زمان اجرا: {now}",
         "🛡️ هیچ سفارش واقعی ثبت نشده است.",
-    ])
+    ]
 
     return "\n".join(lines)
 
 
-# ---------------------- TELEGRAM ---------------------------
-
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning(
-            "Telegram disabled: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing"
-        )
+        logging.warning("Telegram secrets missing")
         print(message)
         return False
 
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    # Telegram message limit is 4096 characters.
+    # Telegram maximum message length is 4096 characters.
     chunks = []
-
     while len(message) > 3800:
         cut = message.rfind("\n", 0, 3800)
         if cut < 1:
             cut = 3800
         chunks.append(message[:cut])
         message = message[cut:].lstrip("\n")
-
     chunks.append(message)
 
-    success = True
+    all_ok = True
 
     for chunk in chunks:
         try:
@@ -702,168 +671,144 @@ def send_telegram(message):
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 },
-                timeout=REQUEST_TIMEOUT,
+                timeout=TIMEOUT,
             )
 
             if response.status_code != 200:
                 logging.error(
                     "Telegram HTTP %s: %s",
                     response.status_code,
-                    response.text[:300],
+                    response.text[:250],
                 )
-                success = False
+                all_ok = False
             elif not response.json().get("ok", False):
-                logging.error("Telegram API rejected message: %s", response.text[:300])
-                success = False
-            else:
-                logging.info("Telegram message sent")
+                logging.error("Telegram rejected message: %s", response.text[:250])
+                all_ok = False
 
-        except Exception as exc:
-            logging.error("Telegram send error: %s", repr(exc))
-            success = False
+        except Exception:
+            logging.exception("Telegram send failed")
+            all_ok = False
 
         time.sleep(0.3)
 
-    return success
+    return all_ok
 
 
-# ---------------------- MAIN SCAN --------------------------
+# ---------------- MAIN ----------------
 
 def run_scan():
-    logging.info("Starting ETH WHALE paper scan")
-
     markets = fetch_markets()
-    ticker_rows = fetch_tickers()
-    ticker_map = normalize_tickers(ticker_rows)
+    tickers = fetch_tickers()
+    ticker_map = build_ticker_map(tickers)
 
     candidates = []
 
-    for row in markets:
-        symbol = market_symbol(row)
+    for market in markets:
+        symbol = get_symbol(market)
 
-        if not symbol or not is_usdt_market(symbol):
+        if not symbol or not is_usdt_symbol(symbol):
             continue
 
-        if not market_is_tradable(row):
-            continue
-
-        price = get_market_price(symbol, ticker_map)
+        price = get_price(symbol, ticker_map)
 
         if price is None or price <= 0:
-            logging.warning("No Bitpin ticker for %s", symbol)
             continue
 
         candidates.append((symbol, price))
 
-    # Sort by ticker volume when available, then use market order as fallback.
-    def ticker_volume(item):
-        symbol = item[0].replace("-", "_").upper()
-        ticker = ticker_map.get(symbol, {}).get("raw", {})
-        volume = first_value(
-            ticker,
-            ("quote_volume", "quoteVolume", "volume", "base_volume"),
-            0,
-        )
+    # Prefer higher-volume markets when the ticker supplies volume.
+    def volume_key(item):
+        row = ticker_map.get(item[0])
+        if row is None:
+            row = ticker_map.get(item[0].replace("_", ""))
+        return get_volume(row) if row else 0.0
 
-        try:
-            return float(volume)
-        except (TypeError, ValueError):
-            return 0.0
-
-    candidates.sort(key=ticker_volume, reverse=True)
+    candidates.sort(key=volume_key, reverse=True)
     candidates = candidates[:MAX_MARKETS]
 
     analyzed = 0
-    failed_candles = 0
+    failed = 0
     signals = []
+
+    logging.info(
+        "Candidates=%d | tickers=%d",
+        len(candidates),
+        len(ticker_map),
+    )
 
     for symbol, price in candidates:
         try:
-            candles15 = fetch_candles(symbol, "15m")
-            candles1h = fetch_candles(symbol, "1h")
+            c15 = fetch_candles(symbol, "15m")
+            c1h = fetch_candles(symbol, "1h")
 
-            if not candles15 or not candles1h:
-                failed_candles += 1
+            if not c15 or not c1h:
+                failed += 1
                 continue
 
-            analysis15 = analyze_timeframe(candles15)
-            analysis1h = analyze_timeframe(candles1h)
+            a15 = analyze_candles(c15)
+            a1h = analyze_candles(c1h)
 
-            if not analysis15 or not analysis1h:
-                failed_candles += 1
+            if not a15 or not a1h:
+                failed += 1
                 continue
 
             analyzed += 1
 
-            signal = create_signal(
-                symbol,
-                price,
-                analysis15,
-                analysis1h,
-            )
+            signal = make_signal(symbol, price, a15, a1h)
 
             if signal:
                 signals.append(signal)
 
         except Exception:
-            failed_candles += 1
-            logging.exception("Market analysis failed: %s", symbol)
+            failed += 1
+            logging.exception("Analysis error for %s", symbol)
 
-        time.sleep(REQUEST_PAUSE)
+        time.sleep(PAUSE)
 
-    signals.sort(key=lambda item: item["score"], reverse=True)
+    signals.sort(key=lambda s: s["score"], reverse=True)
     signals = signals[:MAX_SIGNALS]
 
-    run_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    message = build_message(
-        markets_count=len(candidates),
+    message = make_message(
+        selected=len(candidates),
         analyzed=analyzed,
-        errors=failed_candles,
+        failed=failed,
         signals=signals,
-        run_time=run_time,
     )
 
     print(message)
     send_telegram(message)
 
     logging.info(
-        "SCAN FINISHED | candidates=%d | analyzed=%d | candle_errors=%d | signals=%d",
+        "SCAN COMPLETE | selected=%d | analyzed=%d | failed=%d | signals=%d",
         len(candidates),
         analyzed,
-        failed_candles,
+        failed,
         len(signals),
     )
 
-    # A scan with zero analyzed markets must not be reported as successful.
     if candidates and analyzed == 0:
         raise RuntimeError(
-            "No markets were analyzed because candle data failed. "
-            "Check CANDLES FAILED logs above."
+            "No markets analyzed. See CANDLES FAILED logs above."
         )
 
 
-# ---------------------- ENTRY POINT ------------------------
+def main():
+    logging.info("ETH WHALE PAPER BOT STARTED")
+    logging.info("REAL ORDERS ARE DISABLED")
+
+    run_scan()
+
 
 if __name__ == "__main__":
     try:
-        if not PAPER_MODE:
-            raise RuntimeError(
-                "Safety check failed: this bot is intended for paper mode only."
-            )
-
-        run_scan()
-
+        main()
     except Exception as exc:
         logging.exception("BOT FAILED: %s", repr(exc))
-
-        # Try to notify Telegram without hiding the original failure.
         send_telegram(
             "🐋 <b>ETH WHALE — خطای اجرا</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "❌ اسکن کامل نشد.\n"
             "⛔ هیچ سفارش واقعی ارسال نشده است.\n"
-            f"🔎 خطا: <code>{str(exc)[:800]}</code>"
+            f"🔎 <code>{str(exc)[:700]}</code>"
         )
-
         raise
