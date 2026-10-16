@@ -25,9 +25,11 @@ MAX_SIGNALS_PER_RUN = 3
 MAX_WORKERS = 6
 MAX_MARKETS = 0
 TRADES_TO_ANALYZE = 30
+MIN_TRADES_REQUIRED = 15
 
 MIN_CHANGE_PERCENT = 0.35
 MIN_DIRECTIONAL_CONSISTENCY = 60.0
+MIN_SCORE = 70.0
 
 STOP_PERCENT = 0.80
 TP1_PERCENT = 0.80
@@ -57,7 +59,7 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Eth-Whale-Bitpin-Paper-Bot/3.0",
+    "User-Agent": "Eth-Whale-Bitpin-Paper-Bot/4.0",
     "Accept": "application/json",
 })
 
@@ -97,6 +99,15 @@ def format_price(value):
     return f"{value:.8f}"
 
 
+def safe_html(value):
+    value = str(value)
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def get_json(url, params=None, headers=None):
     response = SESSION.get(
         url,
@@ -116,12 +127,8 @@ def extract_list(data):
         return []
 
     for key in (
-        "results",
-        "data",
-        "markets",
-        "trades",
-        "matches",
-        "items",
+        "results", "data", "markets",
+        "trades", "matches", "items",
     ):
         value = data.get(key)
 
@@ -130,10 +137,7 @@ def extract_list(data):
 
         if isinstance(value, dict):
             for nested_key in (
-                "results",
-                "items",
-                "data",
-                "trades",
+                "results", "items", "data", "trades",
             ):
                 nested = value.get(nested_key)
 
@@ -160,7 +164,7 @@ def extract_list(data):
 
 def telegram_send(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Telegram token or chat ID is missing.")
+        logging.error("Telegram configuration is missing.")
         return False
 
     url = (
@@ -180,12 +184,12 @@ def telegram_send(message):
             },
             timeout=REQUEST_TIMEOUT,
         )
-
         response.raise_for_status()
+
         result = response.json()
 
         if not result.get("ok"):
-            logging.error("Telegram returned ok=false: %s", result)
+            logging.error("Telegram error: %s", result)
             return False
 
         logging.info("Telegram message sent.")
@@ -198,12 +202,11 @@ def telegram_send(message):
 
 # ============================================================
 # STATE STORAGE
-# GitHub Contents API persistence
 # ============================================================
 
 def default_state():
     return {
-        "version": 1,
+        "version": 2,
         "active_trades": {},
         "last_signal_at": {},
         "updated_at": now_text(),
@@ -249,14 +252,14 @@ def load_state():
         payload = response.json()
 
         content = payload.get("content", "")
-        raw = base64.b64decode(
+        decoded = base64.b64decode(
             content.replace("\n", "")
         ).decode("utf-8")
 
-        state = json.loads(raw)
+        state = json.loads(decoded)
 
         if not isinstance(state, dict):
-            raise RuntimeError("Invalid saved state.")
+            raise RuntimeError("Invalid state file.")
 
         state.setdefault("active_trades", {})
         state.setdefault("last_signal_at", {})
@@ -274,11 +277,7 @@ def load_state():
         logging.warning("State loaded locally only.")
         return state, None
 
-    logging.warning(
-        "GitHub persistence is not configured; "
-        "state will be local only."
-    )
-
+    logging.warning("GitHub state persistence is not configured.")
     return default_state(), None
 
 
@@ -295,7 +294,7 @@ def save_state(state, existing_sha=None):
 
     if url and GITHUB_TOKEN:
         body = {
-            "message": "Update Eth Whale paper trading state",
+            "message": "Update Eth Whale paper state",
             "content": base64.b64encode(
                 serialized.encode("utf-8")
             ).decode("ascii"),
@@ -311,8 +310,8 @@ def save_state(state, existing_sha=None):
             json=body,
             timeout=REQUEST_TIMEOUT,
         )
-
         response.raise_for_status()
+
         logging.info("State saved to GitHub.")
         return
 
@@ -323,8 +322,57 @@ def save_state(state, existing_sha=None):
 
 
 # ============================================================
-# BITPIN MARKET DISCOVERY
+# MARKET DISCOVERY AND FILTERING
 # ============================================================
+
+def market_is_active(market):
+    """
+    Reject a market only when an explicit status field
+    indicates it is disabled or inactive.
+    Unknown status values are not treated as proof of inactivity.
+    """
+    for key in (
+        "is_active",
+        "active",
+        "is_enabled",
+        "enabled",
+        "is_trading",
+        "trading_enabled",
+    ):
+        if key not in market:
+            continue
+
+        value = market[key]
+
+        if isinstance(value, bool) and not value:
+            return False
+
+        if isinstance(value, (int, float)) and value == 0:
+            return False
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+
+            if normalized in (
+                "false", "0", "inactive",
+                "disabled", "closed", "off",
+            ):
+                return False
+
+    for key in ("status", "state"):
+        value = market.get(key)
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+
+            if normalized in (
+                "inactive", "disabled", "closed",
+                "delisted", "suspended",
+            ):
+                return False
+
+    return True
+
 
 def get_usdt_markets():
     url = f"{BITPIN_BASE}/v1/mkt/markets/"
@@ -332,9 +380,11 @@ def get_usdt_markets():
     page = 1
 
     while url and page <= 100:
-        params = {"page": page} if page == 1 else None
+        data = get_json(
+            url,
+            params={"page": page} if page == 1 else None,
+        )
 
-        data = get_json(url, params=params)
         rows = extract_list(data)
 
         if not rows:
@@ -366,21 +416,28 @@ def get_usdt_markets():
             if not symbol:
                 continue
 
+            symbol = symbol.replace("-", "_")
+
             is_usdt = (
                 symbol.endswith("_USDT")
-                or symbol.endswith("-USDT")
                 or quote == "USDT"
             )
 
             if not is_usdt:
                 continue
 
-            symbol = symbol.replace("-", "_")
+            if not market_is_active(market):
+                logging.info(
+                    "Skipping inactive market: %s",
+                    symbol,
+                )
+                continue
 
             markets_by_symbol[symbol] = {
                 "symbol": symbol,
                 "base": base,
                 "quote": "USDT",
+                "raw": market,
             }
 
         if isinstance(data, dict) and data.get("next"):
@@ -398,8 +455,7 @@ def get_usdt_markets():
 
 
 # ============================================================
-# RECENT TRADE DATA
-# This strategy analyzes recent trades, not candles.
+# RECENT TRADE DATA VALIDATION
 # ============================================================
 
 def get_recent_trades(symbol):
@@ -435,7 +491,10 @@ def get_recent_trades(symbol):
 
     if len(trades) > 1:
         try:
-            if all(item["time"] is not None for item in trades):
+            if all(
+                item["time"] is not None
+                for item in trades
+            ):
                 def time_key(item):
                     value = item["time"]
 
@@ -462,7 +521,7 @@ def get_current_price(symbol):
 
 
 # ============================================================
-# SIGNAL ANALYSIS
+# IMPROVED SIGNAL SCORING
 # ============================================================
 
 def analyze_market(market):
@@ -471,16 +530,16 @@ def analyze_market(market):
     try:
         trades = get_recent_trades(symbol)
 
-        if len(trades) < 10:
+        if len(trades) < MIN_TRADES_REQUIRED:
             return None
 
         prices = [item["price"] for item in trades]
 
+        if any(price <= 0 for price in prices):
+            return None
+
         first_price = prices[0]
         last_price = prices[-1]
-
-        if first_price <= 0 or last_price <= 0:
-            return None
 
         change_pct = (
             (last_price - first_price) / first_price
@@ -495,8 +554,7 @@ def analyze_market(market):
             favorable = sum(
                 1
                 for previous, current in zip(
-                    prices,
-                    prices[1:],
+                    prices, prices[1:]
                 )
                 if current > previous
             )
@@ -507,8 +565,7 @@ def analyze_market(market):
             favorable = sum(
                 1
                 for previous, current in zip(
-                    prices,
-                    prices[1:],
+                    prices, prices[1:]
                 )
                 if current < previous
             )
@@ -526,14 +583,33 @@ def analyze_market(market):
         if consistency < MIN_DIRECTIONAL_CONSISTENCY:
             return None
 
-        movement_score = (
-            min(abs(change_pct) / 0.50, 1.0) * 40.0
-        )
+        # Change score: 0 to 35 points.
+        # This does not automatically max out after a tiny move.
+        change_score = min(
+            abs(change_pct) / 2.0,
+            1.0,
+        ) * 35.0
+
+        # Directional consistency: 0 to 45 points.
+        consistency_score = (
+            consistency / 100.0
+        ) * 45.0
+
+        # Sample sufficiency: 0 to 20 points.
+        sample_score = min(
+            len(trades) / TRADES_TO_ANALYZE,
+            1.0,
+        ) * 20.0
 
         score = round(
-            consistency * 0.60 + movement_score,
+            change_score
+            + consistency_score
+            + sample_score,
             1,
         )
+
+        if score < MIN_SCORE:
+            return None
 
         entry = last_price
 
@@ -575,18 +651,8 @@ def analyze_market(market):
 
 
 # ============================================================
-# TELEGRAM MESSAGE FORMATTING
+# TELEGRAM MESSAGES
 # ============================================================
-
-def safe_html(value):
-    text_value = str(value)
-    return (
-        text_value
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
 
 def signal_message(signal, number):
     if signal["direction"] == "LONG":
@@ -594,12 +660,12 @@ def signal_message(signal, number):
     else:
         direction_text = "🔴 SHORT | فروش آزمایشی"
 
+    symbol = safe_html(signal["symbol"])
+
     tp1_pnl = POSITION_USDT * TP1_PERCENT / 100
     tp2_pnl = POSITION_USDT * TP2_PERCENT / 100
     tp3_pnl = POSITION_USDT * TP3_PERCENT / 100
     sl_pnl = -POSITION_USDT * STOP_PERCENT / 100
-
-    symbol = safe_html(signal["symbol"])
 
     return (
         "🌊 <b>ETH WHALE</b>\n"
@@ -607,30 +673,22 @@ def signal_message(signal, number):
         f"<b>سیگنال #{number}</b> | {direction_text}\n"
         f"💎 جفت‌ارز: <code>{symbol}</code>\n"
         f"⭐ امتیاز الگوریتم: <b>{signal['score']}/100</b>\n"
-        f"📈 تغییر معاملات اخیر: "
-        f"<b>{signal['change_pct']:+.3f}%</b>\n"
+        f"📈 تغییر قیمت: <b>{signal['change_pct']:+.3f}%</b>\n"
         f"🎯 هم‌جهتی حرکت‌ها: "
         f"<b>{signal['consistency']:.1f}%</b>\n"
-        f"🔎 تعداد معاملات بررسی‌شده: "
-        f"<b>{signal['trades_count']}</b>\n"
+        f"🔎 تعداد معاملات: <b>{signal['trades_count']}</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "💰 <b>قیمت‌های فرضی</b>\n"
-        f"🔹 ورود: "
-        f"<code>{format_price(signal['entry'])}</code>\n"
-        f"🛑 حد ضرر: "
-        f"<code>{format_price(signal['stop'])}</code>\n"
-        f"🎯 TP1: "
-        f"<code>{format_price(signal['tp1'])}</code>\n"
-        f"🎯 TP2: "
-        f"<code>{format_price(signal['tp2'])}</code>\n"
-        f"🏆 TP3: "
-        f"<code>{format_price(signal['tp3'])}</code>\n"
+        f"🔹 ورود: <code>{format_price(signal['entry'])}</code>\n"
+        f"🛑 حد ضرر: <code>{format_price(signal['stop'])}</code>\n"
+        f"🎯 TP1: <code>{format_price(signal['tp1'])}</code>\n"
+        f"🎯 TP2: <code>{format_price(signal['tp2'])}</code>\n"
+        f"🏆 TP3: <code>{format_price(signal['tp3'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "⚙️ <b>مدیریت سرمایه</b>\n"
         f"💵 سرمایه: <b>{CAPITAL_USDT:.2f} USDT</b>\n"
         f"⚡ اهرم: <b>{LEVERAGE}x</b>\n"
-        f"📦 ارزش اسمی موقعیت: "
-        f"<b>{POSITION_USDT:.2f} USDT</b>\n"
+        f"📦 ارزش اسمی: <b>{POSITION_USDT:.2f} USDT</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "📊 <b>سود و زیان ناخالص فرضی</b>\n"
         f"🟢 TP1: <b>+{tp1_pnl:.2f} USDT</b>\n"
@@ -640,7 +698,7 @@ def signal_message(signal, number):
         "━━━━━━━━━━━━━━━━━━\n"
         "🧪 <b>PAPER TRADING ONLY</b>\n"
         "🚫 سفارش واقعی ثبت نمی‌شود.\n"
-        "⚠️ تحلیل معاملات اخیر است و سود تضمین نمی‌شود.\n"
+        "⚠️ سیگنال آزمایشی است؛ سود تضمین نمی‌شود.\n"
         f"🕒 {now_text()}"
     )
 
@@ -654,11 +712,9 @@ def target_message(trade, target_name, current_price):
         f"💎 جفت‌ارز: <code>{symbol}</code>\n"
         f"📌 جهت: <b>{trade['direction']}</b>\n"
         f"🎯 هدف: <b>{target_name}</b>\n"
-        f"💹 قیمت مشاهده‌شده: "
+        f"💹 قیمت فعلی: "
         f"<code>{format_price(current_price)}</code>\n"
-        f"🔹 ورود: "
-        f"<code>{format_price(trade['entry'])}</code>\n"
-        "ℹ️ هشدار آزمایشی؛ سفارش واقعی اجرا نشده است."
+        "🧪 فقط هشدار آزمایشی؛ سفارش واقعی اجرا نشده است."
     )
 
 
@@ -671,20 +727,18 @@ def closed_message(trade, reason, current_price, pnl):
         "━━━━━━━━━━━━━━━━━━\n"
         f"💎 جفت‌ارز: <code>{symbol}</code>\n"
         f"📌 جهت: <b>{trade['direction']}</b>\n"
-        f"🏁 علت بسته‌شدن: <b>{reason}</b>\n"
+        f"🏁 علت: <b>{reason}</b>\n"
         f"💹 قیمت مشاهده‌شده: "
         f"<code>{format_price(current_price)}</code>\n"
-        f"{icon} سود/زیان ناخالص فرضی: "
-        f"<b>{pnl:+.2f} USDT</b>\n"
-        "⚠️ کارمزد، لغزش قیمت و فاندینگ محاسبه نشده‌اند.\n"
+        f"{icon} سود/زیان ناخالص فرضی: <b>{pnl:+.2f} USDT</b>\n"
+        "⚠️ کارمزد و لغزش قیمت محاسبه نشده‌اند.\n"
         "🧪 PAPER ONLY — سفارش واقعی ثبت نشده است."
     )
 
 
 # ============================================================
-# PAPER TRADE MONITOR
-# TP1 and TP2 send alerts only.
-# The simulated position closes at SL or TP3.
+# PAPER POSITION MONITOR
+# TP1/TP2 are alerts only; full position closes at SL or TP3.
 # ============================================================
 
 def reached_target(direction, price, target):
@@ -703,7 +757,6 @@ def crossed_stop(direction, price, stop):
 
 def monitor_active_trades(state):
     active = state["active_trades"]
-    changed = False
 
     for symbol in list(active.keys()):
         trade = active[symbol]
@@ -712,7 +765,6 @@ def monitor_active_trades(state):
             current = get_current_price(symbol)
 
             if current is None:
-                logging.warning("No current price for %s", symbol)
                 continue
 
             if crossed_stop(
@@ -732,7 +784,6 @@ def monitor_active_trades(state):
                 )
 
                 del active[symbol]
-                changed = True
                 continue
 
             targets = [
@@ -770,8 +821,6 @@ def monitor_active_trades(state):
                         if item in reached
                     ]
 
-                    changed = True
-
                     if name == "TP3":
                         pnl = (
                             POSITION_USDT
@@ -798,11 +847,9 @@ def monitor_active_trades(state):
                 exc,
             )
 
-    return changed
-
 
 # ============================================================
-# COOLDOWN AND DUPLICATE PREVENTION
+# COOLDOWN AND SIGNAL SELECTION
 # ============================================================
 
 def is_in_cooldown(state, symbol):
@@ -816,14 +863,9 @@ def is_in_cooldown(state, symbol):
             now_ts() - float(last)
             < SIGNAL_COOLDOWN_HOURS * 3600
         )
-
     except (TypeError, ValueError):
         return False
 
-
-# ============================================================
-# CREATE NEW SIGNALS
-# ============================================================
 
 def create_new_signals(state, markets):
     candidates = []
@@ -861,7 +903,7 @@ def create_new_signals(state, markets):
 
             except Exception as exc:
                 logging.warning(
-                    "Market scan error: %s",
+                    "Scan task failed: %s",
                     exc,
                 )
 
@@ -882,15 +924,9 @@ def create_new_signals(state, markets):
         state["active_trades"][symbol] = signal
         state["last_signal_at"][symbol] = now_ts()
 
-        sent = telegram_send(
+        telegram_send(
             signal_message(signal, index)
         )
-
-        if not sent:
-            logging.error(
-                "Could not send signal notification for %s.",
-                symbol,
-            )
 
     return len(selected)
 
@@ -905,24 +941,12 @@ def main():
             "Safety stop: PAPER_MODE must remain True."
         )
 
-    if not TELEGRAM_TOKEN:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN secret."
+            "Missing Telegram token or chat ID."
         )
 
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "Missing TELEGRAM_CHAT_ID secret."
-        )
-
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        logging.warning(
-            "GitHub state persistence is not configured. "
-            "State may be lost on a fresh runner."
-        )
-
-    logging.info("Starting ETH WHALE Bitpin paper bot.")
-
+    logging.info("Starting ETH WHALE Bitpin Paper Bot.")
     logging.info(
         "Capital=%.2f USDT | leverage=%sx | notional=%.2f USDT",
         CAPITAL_USDT,
@@ -936,18 +960,18 @@ def main():
 
     if not markets:
         raise RuntimeError(
-            "No USDT markets found. "
-            "Check the Bitpin market API response."
+            "No active-looking USDT markets found. "
+            "Check the Bitpin API response."
         )
 
     logging.info(
-        "USDT markets found: %s",
+        "USDT markets accepted: %s",
         len(markets),
     )
 
     monitor_active_trades(state)
 
-    new_signals = create_new_signals(
+    count = create_new_signals(
         state,
         markets,
     )
@@ -958,9 +982,8 @@ def main():
     )
 
     logging.info(
-        "Finished. New signals=%s | active paper trades=%s | "
-        "real orders=OFF.",
-        new_signals,
+        "Finished | new signals=%s | active paper trades=%s",
+        count,
         len(state["active_trades"]),
     )
 
@@ -968,7 +991,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-
     except Exception:
         logging.exception("Bot stopped due to an error.")
         raise
