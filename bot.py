@@ -2,13 +2,12 @@
 import requests
 from datetime import datetime, timezone
 
-BASE = "https://api.bitpin.market"
-SYMBOLS = ["BTC_USDT", "ETH_USDT"]
-TIMEOUT = 15
+BASE = "https://api.bitpin.ir"
+TIMEOUT = 12
 
-print("BITPIN RECENT TRADES TEST")
+print("BITPIN MARKET DISCOVERY TEST")
 print("UTC:", datetime.now(timezone.utc).isoformat())
-print("MODE: TEST ONLY")
+print("MODE: READ ONLY")
 print("REAL ORDERS: OFF")
 
 session = requests.Session()
@@ -16,44 +15,96 @@ session.headers.update({
     "User-Agent": "Bitpin-ReadOnly-Diagnostic/1.0"
 })
 
-for symbol in SYMBOLS:
-    url = f"{BASE}/api/v1/mth/matches/{symbol}/"
+# 1. Find BTC_USDT market ID
+print("\n=== 1. MARKET LOOKUP ===")
 
-    print("\n" + "=" * 45)
-    print("SYMBOL:", symbol)
-    print("URL:", url)
+try:
+    url = BASE + "/v1/mkt/markets/"
+    response = session.get(
+        url,
+        params={"page": 1},
+        timeout=TIMEOUT
+    )
+    print("MARKETS HTTP:", response.status_code)
 
+    response.raise_for_status()
+    payload = response.json()
+
+    if isinstance(payload, dict):
+        markets = payload.get("results", [])
+    elif isinstance(payload, list):
+        markets = payload
+    else:
+        markets = []
+
+    print("MARKETS RECEIVED:", len(markets))
+
+    found = False
+    for market in markets:
+        code = market.get("code") or market.get("symbol")
+        if code == "BTC_USDT":
+            found = True
+            print("BTC_USDT FOUND")
+            print("MARKET ID:", market.get("id"))
+            print("MARKET CODE:", code)
+            print("MARKET NAME:", market.get("title"))
+            print("MARKET FIELDS:", list(market.keys()))
+            print("MARKET SAMPLE:", str(market)[:1200])
+            break
+
+    if not found:
+        print("BTC_USDT NOT FOUND ON PAGE 1")
+
+except Exception as error:
+    print("MARKET ERROR:", repr(error)[:500])
+
+# 2. Look for API documentation/schema
+print("\n=== 2. API DOCUMENTATION DISCOVERY ===")
+
+paths = [
+    "/openapi.json",
+    "/swagger.json",
+    "/api/schema/",
+    "/schema/",
+    "/swagger/",
+    "/api/docs/",
+    "/docs/",
+]
+
+for path in paths:
+    url = BASE + path
     try:
         response = session.get(url, timeout=TIMEOUT)
-        print("HTTP STATUS:", response.status_code)
-        print("FINAL URL:", response.url)
-        print("CONTENT TYPE:",
-              response.headers.get("content-type", ""))
+        content_type = response.headers.get(
+            "content-type", ""
+        )
+        print("\nPATH:", path)
+        print("HTTP:", response.status_code)
+        print("CONTENT TYPE:", content_type)
 
-        try:
-            data = response.json()
-        except ValueError:
-            print("RESPONSE:", response.text[:500])
-            continue
-
-        print("JSON TYPE:", type(data).__name__)
-
-        if isinstance(data, list):
-            print("TRADE COUNT:", len(data))
-            if data:
-                print("FIRST TRADE:", str(data[0])[:1000])
-            else:
-                print("EMPTY TRADE LIST")
-
-        elif isinstance(data, dict):
-            print("JSON KEYS:", list(data.keys())[:20])
-            print("RESPONSE:", str(data)[:1000])
-
-        else:
-            print("RESPONSE:", str(data)[:500])
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    print("KEYS:", list(data.keys())[:20])
+                    paths_data = data.get("paths")
+                    if isinstance(paths_data, dict):
+                        matches = [
+                            p for p in paths_data
+                            if any(word in p.lower()
+                                   for word in (
+                                       "candle", "ohlc",
+                                       "chart", "kline"
+                                   ))
+                        ]
+                        print("CHART PATHS:", matches[:30])
+                else:
+                    print("JSON TYPE:", type(data).__name__)
+            except ValueError:
+                print("BODY SAMPLE:", response.text[:250])
 
     except requests.RequestException as error:
-        print("REQUEST ERROR:", str(error)[:500])
+        print("REQUEST ERROR:", str(error)[:250])
 
 print("\nTEST FINISHED")
 print("No trading orders were sent.")
