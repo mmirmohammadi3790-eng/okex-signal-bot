@@ -6,10 +6,9 @@ import requests
 from datetime import datetime, timezone
 
 # ============================================================
-# 🐋 ETH WHALE V3
-# Market trend + one best LONG/SHORT candidate
-# Kraken public market data | PAPER ANALYSIS ONLY
-# NO REAL ORDERS
+# 🐋 ETH WHALE V4
+# Kraken market analysis | Smart entry filter
+# PAPER ANALYSIS ONLY — NO REAL ORDERS
 # ============================================================
 
 BOT_NAME = "🐋 ETH WHALE"
@@ -18,10 +17,12 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 TIMEOUT = 20
+
 MIN_SCORE = 75
 STRONG_SCORE = 85
+MIN_LEVEL_DISTANCE_PCT = 0.30
+MAX_SIGNAL_COUNT = 1
 
-# Kraken market pairs; all prices are quoted in USD.
 MARKETS = {
     "BTC": "XBTUSD",
     "ETH": "ETHUSD",
@@ -48,8 +49,12 @@ logging.basicConfig(
 )
 
 S = requests.Session()
-S.headers.update({"User-Agent": "ETH-WHALE-Market-Report/3.0"})
+S.headers.update({"User-Agent": "ETH-WHALE-Market-Report/4.0"})
 
+
+# ------------------------------------------------------------
+# MARKET DATA
+# ------------------------------------------------------------
 
 def get_candles(pair, interval):
     response = S.get(
@@ -72,8 +77,7 @@ def get_candles(pair, interval):
 
     rows = result[pair_keys[0]]
 
-    # Kraken's final row is the currently forming candle.
-    # Exclude it so incomplete candles don't create false signals.
+    # Remove the currently forming candle.
     if len(rows) > 1:
         rows = rows[:-1]
 
@@ -98,6 +102,10 @@ def get_candles(pair, interval):
 
     return candles
 
+
+# ------------------------------------------------------------
+# INDICATORS
+# ------------------------------------------------------------
 
 def ema(values, period):
     alpha = 2.0 / (period + 1.0)
@@ -128,20 +136,20 @@ def rsi(values, period=14):
         return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
-    return 100.0 - 100.0 / (1.0 + rs)
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def atr(candles, period=14):
     ranges = []
 
     for i in range(1, len(candles)):
-        c = candles[i]
-        p = candles[i - 1]
+        current = candles[i]
+        previous = candles[i - 1]
 
         ranges.append(max(
-            c["high"] - c["low"],
-            abs(c["high"] - p["close"]),
-            abs(c["low"] - p["close"]),
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
         ))
 
     if len(ranges) < period:
@@ -176,6 +184,7 @@ def analyze(candles):
         direction = "NEUTRAL"
 
     last = candles[-1]
+
     if last["close"] > last["open"]:
         candle_direction = "LONG"
     elif last["close"] < last["open"]:
@@ -195,13 +204,16 @@ def analyze(candles):
         "candle_direction": candle_direction,
         "change": (
             (closes[-1] / closes[-2] - 1) * 100
-            if closes[-2] else 0
+            if closes[-2] else 0.0
         ),
     }
 
 
+# ------------------------------------------------------------
+# SUPPORT / RESISTANCE
+# ------------------------------------------------------------
+
 def levels(candles, price):
-    """Identify recent swing lows and highs from closed candles."""
     lows = []
     highs = []
 
@@ -209,27 +221,29 @@ def levels(candles, price):
     end = len(candles) - 2
 
     for i in range(start, end):
-        c = candles[i]
+        current = candles[i]
         neighbors = candles[i - 2:i] + candles[i + 1:i + 3]
 
         if len(neighbors) != 4:
             continue
 
-        if all(c["low"] < n["low"] for n in neighbors):
-            if c["low"] < price:
-                lows.append(c["low"])
+        if all(current["low"] < n["low"] for n in neighbors):
+            if current["low"] < price:
+                lows.append(current["low"])
 
-        if all(c["high"] > n["high"] for n in neighbors):
-            if c["high"] > price:
-                highs.append(c["high"])
+        if all(current["high"] > n["high"] for n in neighbors):
+            if current["high"] > price:
+                highs.append(current["high"])
 
     tolerance = price * 0.001
 
     def deduplicate(items):
         result = []
-        for x in sorted(items):
-            if not result or abs(x - result[-1]) > tolerance:
-                result.append(x)
+
+        for value in sorted(items):
+            if not result or abs(value - result[-1]) > tolerance:
+                result.append(value)
+
         return result
 
     supports = sorted(
@@ -244,23 +258,85 @@ def levels(candles, price):
     return supports, resistances
 
 
+# ------------------------------------------------------------
+# SMART ENTRY FILTER
+# ------------------------------------------------------------
+
+def distance_pct(price, level):
+    if price <= 0 or level is None:
+        return None
+
+    return abs(price - level) / price * 100.0
+
+
+def check_entry_filter(
+    direction,
+    price,
+    supports,
+    resistances,
+    candle_closed=True,
+):
+    """
+    Reject a candidate if it is too close to the next obstacle.
+    The candle data passed here excludes Kraken's forming candle.
+    """
+
+    if not candle_closed:
+        return False, "کندل هنوز بسته نشده است"
+
+    if direction == "SHORT":
+        nearby = [x for x in supports if x < price]
+
+        if nearby:
+            nearest_support = max(nearby)
+            distance = distance_pct(price, nearest_support)
+
+            if distance is not None and distance < MIN_LEVEL_DISTANCE_PCT:
+                return (
+                    False,
+                    f"فاصله تا حمایت فقط {distance:.2f}% است؛ "
+                    "ورود SHORT رد شد",
+                )
+
+    elif direction == "LONG":
+        nearby = [x for x in resistances if x > price]
+
+        if nearby:
+            nearest_resistance = min(nearby)
+            distance = distance_pct(price, nearest_resistance)
+
+            if distance is not None and distance < MIN_LEVEL_DISTANCE_PCT:
+                return (
+                    False,
+                    f"فاصله تا مقاومت فقط {distance:.2f}% است؛ "
+                    "ورود LONG رد شد",
+                )
+
+    else:
+        return False, "جهت روند مشخص نیست"
+
+    return True, "فیلتر فاصله تأیید شد"
+
+
+# ------------------------------------------------------------
+# SIGNAL SCORING
+# ------------------------------------------------------------
+
 def score_signal(m15, h1, h4, supports, resistances):
     direction = h4["direction"]
 
-    # Require agreement between 1h and 4h.
     if direction not in ("LONG", "SHORT"):
         return None
 
     if h1["direction"] != direction:
         return None
 
-    score = 25  # 1h + 4h trend agreement
+    score = 25
 
-    # EMA confirmation: 20 points total.
-    score += 10
-    score += 10
+    # EMA trend alignment.
+    score += 20
 
-    # RSI / momentum: maximum 15 points.
+    # RSI / momentum.
     r = h1["rsi"]
 
     if direction == "LONG":
@@ -278,8 +354,9 @@ def score_signal(m15, h1, h4, supports, resistances):
         elif 50 < r <= 55:
             score += 5
 
-    # Volume confirmation: maximum 15.
+    # Volume.
     vr = h1["volume_ratio"]
+
     if vr >= 1.5:
         score += 15
     elif vr >= 1.15:
@@ -289,7 +366,7 @@ def score_signal(m15, h1, h4, supports, resistances):
     else:
         score += 3
 
-    # Avoid entering too close to an obstacle: maximum 15.
+    # Distance from the next obstacle, measured in ATR.
     price = h1["price"]
     volatility = h1["atr"]
 
@@ -297,16 +374,16 @@ def score_signal(m15, h1, h4, supports, resistances):
         return None
 
     if direction == "LONG":
-        above = [x for x in resistances if x > price]
+        nearby = [x for x in resistances if x > price]
         distance = (
-            (min(above) - price) / volatility
-            if above else 3.0
+            (min(nearby) - price) / volatility
+            if nearby else 3.0
         )
     else:
-        below = [x for x in supports if x < price]
+        nearby = [x for x in supports if x < price]
         distance = (
-            (price - max(below)) / volatility
-            if below else 3.0
+            (price - max(nearby)) / volatility
+            if nearby else 3.0
         )
 
     if distance >= 1.5:
@@ -316,7 +393,7 @@ def score_signal(m15, h1, h4, supports, resistances):
     elif distance >= 0.65:
         score += 5
 
-    # 15m candle confirmation: maximum 10.
+    # Closed 15m candle confirmation contributes to the score.
     if m15["candle_direction"] == direction:
         score += 10
     elif m15["candle_direction"] == "NEUTRAL":
@@ -324,6 +401,10 @@ def score_signal(m15, h1, h4, supports, resistances):
 
     return min(score, 100)
 
+
+# ------------------------------------------------------------
+# HYPOTHETICAL TRADE LEVELS — NO ORDER EXECUTION
+# ------------------------------------------------------------
 
 def trade_levels(direction, price, volatility, supports, resistances):
     if volatility <= 0:
@@ -339,6 +420,7 @@ def trade_levels(direction, price, volatility, supports, resistances):
                 stop = candidate
 
         risk = price - stop
+
         if risk <= 0:
             return None
 
@@ -348,7 +430,7 @@ def trade_levels(direction, price, volatility, supports, resistances):
             price + risk * 2,
         ]
 
-    else:
+    elif direction == "SHORT":
         stop = price + 1.5 * volatility
         nearby = [x for x in resistances if x > price]
 
@@ -358,6 +440,7 @@ def trade_levels(direction, price, volatility, supports, resistances):
                 stop = candidate
 
         risk = stop - price
+
         if risk <= 0:
             return None
 
@@ -367,12 +450,19 @@ def trade_levels(direction, price, volatility, supports, resistances):
             price - risk * 2,
         ]
 
+    else:
+        return None
+
     return {
         "entry": price,
         "stop": stop,
         "targets": targets,
     }
 
+
+# ------------------------------------------------------------
+# REPORT FORMATTING
+# ------------------------------------------------------------
 
 def fmt(value):
     if value is None:
@@ -388,8 +478,9 @@ def fmt(value):
 
 def trend_label(items, timeframe):
     directions = [
-        x[timeframe]["direction"]
-        for x in items if timeframe in x
+        item[timeframe]["direction"]
+        for item in items
+        if timeframe in item
     ]
 
     if not directions:
@@ -426,7 +517,7 @@ def make_report(analyses, errors):
             "━━━━━━━━━━━━━━━━━━\n"
             "📊 گزارش روند بازار\n"
             "⚠️ هیچ بازار معتبری تحلیل نشد.\n"
-            f"خطاها: {len(errors)}\n"
+            f"خطاهای داده: {len(errors)}\n"
             "لطفاً خطاهای Kraken را بررسی کن.\n"
             f"زمان: {now}\n"
             "🚫 بدون سفارش واقعی."
@@ -442,7 +533,10 @@ def make_report(analyses, errors):
         f"📅 روزانه: {trend_label(analyses, 'd1')}",
     ]
 
-    btc = next((x for x in analyses if x["symbol"] == "BTC"), None)
+    btc = next(
+        (x for x in analyses if x["symbol"] == "BTC"),
+        None,
+    )
     alts = [x for x in analyses if x["symbol"] != "BTC"]
 
     if btc:
@@ -459,9 +553,12 @@ def make_report(analyses, errors):
 
     candidates = [
         x for x in analyses
-        if x["score"] is not None and x["score"] >= MIN_SCORE
+        if x["score"] is not None
+        and x["score"] >= MIN_SCORE
+        and x["entry_allowed"]
     ]
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates = candidates[:MAX_SIGNAL_COUNT]
 
     lines.extend([
         "",
@@ -472,34 +569,62 @@ def make_report(analyses, errors):
 
     if not candidates:
         lines.extend([
-            "⚪ WAIT — ارز واجد شرایط پیدا نشد",
+            "⚪ WAIT — ورود واجد شرایط پیدا نشد",
             f"حداقل امتیاز لازم: {MIN_SCORE}/100",
         ])
+
+        rejected = [
+            x for x in analyses
+            if x["score"] is not None
+            and x["score"] >= MIN_SCORE
+            and not x["entry_allowed"]
+        ]
+
+        if rejected:
+            lines.append("📌 دلایل رد سیگنال:")
+            for item in sorted(
+                rejected,
+                key=lambda x: x["score"],
+                reverse=True,
+            )[:3]:
+                lines.append(
+                    f"• {item['symbol']}: {item['filter_reason']}"
+                )
+        else:
+            lines.append(
+                "📌 هیچ نمادی شرایط کامل امتیازدهی و روند را نداشت."
+            )
+
     else:
         best = candidates[0]
         direction = best["h4"]["direction"]
         price = best["h1"]["price"]
 
-        levels_trade = trade_levels(
-            direction, price, best["h1"]["atr"],
-            best["supports"], best["resistances"]
+        levels_trade_result = trade_levels(
+            direction,
+            price,
+            best["h1"]["atr"],
+            best["supports"],
+            best["resistances"],
         )
 
-        if levels_trade is None:
+        if levels_trade_result is None:
             lines.append("⚪ WAIT — محاسبه ریسک معتبر نبود")
         else:
             score = best["score"]
-            strength = "قوی" if score >= STRONG_SCORE else "قابل بررسی"
+            strength = (
+                "قوی" if score >= STRONG_SCORE else "قابل بررسی"
+            )
 
             lines.extend([
                 f"🪙 ارز: {best['symbol']}/USD",
                 f"📌 جهت: {'🟢 LONG' if direction == 'LONG' else '🔴 SHORT'}",
                 f"💪 قدرت سیگنال: {score}/100 — {strength}",
-                f"💵 ورود فرضی: {fmt(levels_trade['entry'])}",
-                f"🛑 حد ضرر: {fmt(levels_trade['stop'])}",
-                f"🎯 TP1: {fmt(levels_trade['targets'][0])}",
-                f"🎯 TP2: {fmt(levels_trade['targets'][1])}",
-                f"🎯 TP3: {fmt(levels_trade['targets'][2])}",
+                f"💵 ورود فرضی: {fmt(levels_trade_result['entry'])}",
+                f"🛑 حد ضرر: {fmt(levels_trade_result['stop'])}",
+                f"🎯 TP1: {fmt(levels_trade_result['targets'][0])}",
+                f"🎯 TP2: {fmt(levels_trade_result['targets'][1])}",
+                f"🎯 TP3: {fmt(levels_trade_result['targets'][2])}",
                 f"📊 RSI یک‌ساعته: {best['h1']['rsi']:.1f}",
                 f"📦 نسبت حجم: {best['h1']['volume_ratio']:.2f}x",
                 "",
@@ -511,21 +636,23 @@ def make_report(analyses, errors):
             ])
 
             support = next(
-                (x for x in best["supports"] if x < price), None
+                (x for x in best["supports"] if x < price),
+                None,
             )
             resistance = next(
-                (x for x in best["resistances"] if x > price), None
+                (x for x in best["resistances"] if x > price),
+                None,
             )
 
             lines.extend([
                 "",
                 "📏 فاصله تا سطوح:",
                 (
-                    f"حمایت: {(price - support) / price * 100:.2f}%"
+                    f"حمایت: {distance_pct(price, support):.2f}%"
                     if support else "حمایت: نامشخص"
                 ),
                 (
-                    f"مقاومت: {(resistance - price) / price * 100:.2f}%"
+                    f"مقاومت: {distance_pct(price, resistance):.2f}%"
                     if resistance else "مقاومت: نامشخص"
                 ),
             ])
@@ -544,6 +671,10 @@ def make_report(analyses, errors):
 
     return "\n".join(lines)
 
+
+# ------------------------------------------------------------
+# TELEGRAM
+# ------------------------------------------------------------
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
@@ -566,8 +697,12 @@ def send_telegram(message):
         raise RuntimeError("Telegram rejected the message")
 
 
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+
 def main():
-    logging.info("Starting %s — Kraken data source", BOT_NAME)
+    logging.info("Starting %s — Kraken V4", BOT_NAME)
 
     analyses = []
     errors = []
@@ -595,19 +730,34 @@ def main():
                 data["resistances"],
             )
 
+            # Crucial: apply the entry filter BEFORE candidate selection.
+            direction = data["h4"]["direction"]
+
+            data["entry_allowed"], data["filter_reason"] = (
+                check_entry_filter(
+                    direction=direction,
+                    price=data["h1"]["price"],
+                    supports=data["supports"],
+                    resistances=data["resistances"],
+                    # get_candles() already removes the forming candle.
+                    candle_closed=True,
+                )
+            )
+
             analyses.append(data)
 
             logging.info(
-                "%s analyzed; score=%s",
+                "%s analyzed | score=%s | allowed=%s | reason=%s",
                 symbol,
                 data["score"],
+                data["entry_allowed"],
+                data["filter_reason"],
             )
 
         except Exception as exc:
             errors.append(f"{symbol}: {str(exc)[:180]}")
             logging.warning("%s failed: %s", symbol, exc)
 
-        # Be considerate of the public API.
         time.sleep(0.5)
 
     report = make_report(analyses, errors)
@@ -615,62 +765,11 @@ def main():
     send_telegram(report)
 
     logging.info(
-        "Report sent. Markets=%d Errors=%d",
-        len(analyses), len(errors)
+        "Report sent | Markets=%d | Errors=%d",
+        len(analyses),
+        len(errors),
     )
 
 
 if __name__ == "__main__":
     main()
-# ==========================================
-# SMART ENTRY FILTER — ETH WHALE
-# ==========================================
-
-MIN_LEVEL_DISTANCE_PCT = 0.30
-REQUIRE_CLOSED_CANDLE = True
-MAX_SIGNAL_COUNT = 1
-
-
-def distance_pct(price, level):
-    """فاصله درصدی قیمت تا حمایت یا مقاومت"""
-    if not price or not level:
-        return 999.0
-    return abs(price - level) / price * 100.0
-
-
-def check_entry_filter(
-    direction,
-    price,
-    support,
-    resistance,
-    candle_closed=True,
-):
-    """
-    فقط فیلتر فاصله از سطوح و بسته‌شدن کندل را بررسی می‌کند.
-    این تابع به‌تنهایی تأیید شکست حمایت یا مقاومت نیست.
-    """
-
-    if not candle_closed:
-        return False, "انتظار برای بسته‌شدن کندل"
-
-    if direction == "SHORT" and support:
-        dist = distance_pct(price, support)
-
-        if price > support and dist < MIN_LEVEL_DISTANCE_PCT:
-            return (
-                False,
-                f"فاصله تا حمایت فقط {dist:.2f}% است؛ "
-                "منتظر شکست معتبر حمایت بمان",
-            )
-
-    elif direction == "LONG" and resistance:
-        dist = distance_pct(price, resistance)
-
-        if price < resistance and dist < MIN_LEVEL_DISTANCE_PCT:
-            return (
-                False,
-                f"فاصله تا مقاومت فقط {dist:.2f}% است؛ "
-                "منتظر شکست معتبر مقاومت بمان",
-            )
-
-    return True, "فیلتر فاصله تأیید شد"
