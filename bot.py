@@ -2,34 +2,45 @@
 import requests
 from datetime import datetime, timezone
 
-BASE = "https://api.bitpin.market"
 TIMEOUT = 12
 SYMBOL = "BTC_USDT"
 
-# مسیرهای احتمالی؛ هیچ‌کدام از قبل تأییدشده نیستند.
-CANDIDATES = [
-    ("/api/v1/mkt/candles/", {"market": SYMBOL, "interval": "1h"}),
-    ("/api/v1/mkt/candles/", {"symbol": SYMBOL, "interval": "1h"}),
-    ("/api/v1/mkt/candles/", {"market_id": 2, "interval": "1h"}),
-    ("/api/v1/mkt/ohlcv/", {"market": SYMBOL, "interval": "1h"}),
-    ("/api/v1/mkt/ohlcv/", {"symbol": SYMBOL, "interval": "1h"}),
-    ("/api/v1/mkt/klines/", {"symbol": SYMBOL, "interval": "1h"}),
+TESTS = [
+    (
+        "https://api.bitpin.market/api/v1/mkt/candles/",
+        {"market": SYMBOL, "tf": "1h"},
+    ),
+    (
+        "https://api.bitpin.market/api/v1/mkt/candles/",
+        {"symbol": SYMBOL, "tf": "1h"},
+    ),
+    (
+        "https://api.bitpin.market/api/v1/mkt/candles/",
+        {"market_id": 2, "tf": "1h"},
+    ),
+    (
+        "https://api.bitpin.market/api/v1/mkt/candles/",
+        {"market": 2, "timeframe": "1h"},
+    ),
+    (
+        "https://api.bitpin.market/api/v1/currencies/candles",
+        {"symbol": SYMBOL, "tf": "1h"},
+    ),
 ]
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Bitpin-ReadOnly-Diagnostic/1.0"
+    "User-Agent": "Bitpin-ReadOnly-Test/1.0"
 })
 
-print("BITPIN CANDLE ROUTE TEST")
+print("BITPIN CANDLE PARAMETER TEST")
 print("UTC:", datetime.now(timezone.utc).isoformat())
-print("MODE: READ ONLY")
-print("REAL ORDERS: OFF")
+print("READ ONLY: YES")
+print("REAL ORDERS: DISABLED")
 
-for path, params in CANDIDATES:
-    url = BASE + path
-    print("\n" + "=" * 45)
-    print("PATH:", path)
+for url, params in TESTS:
+    print("\n" + "-" * 50)
+    print("URL:", url)
     print("PARAMS:", params)
 
     try:
@@ -38,30 +49,38 @@ for path, params in CANDIDATES:
             params=params,
             timeout=TIMEOUT
         )
+
         print("HTTP:", response.status_code)
         print("FINAL URL:", response.url)
-        print("CONTENT TYPE:",
-              response.headers.get("content-type", ""))
 
         try:
             data = response.json()
             print("JSON TYPE:", type(data).__name__)
 
             if isinstance(data, dict):
-                print("KEYS:", list(data.keys())[:25])
-                print("SAMPLE:", str(data)[:600])
+                print("KEYS:", list(data.keys())[:20])
+
+                rows = data.get("data", data.get("results"))
+                if isinstance(rows, list):
+                    print("CANDLE COUNT:", len(rows))
+                    if rows:
+                        print("FIRST ROW:", str(rows[0])[:500])
+                else:
+                    print("SAMPLE:", str(data)[:500])
+
             elif isinstance(data, list):
-                print("ITEM COUNT:", len(data))
+                print("ROW COUNT:", len(data))
                 if data:
-                    print("FIRST ITEM:", str(data[0])[:600])
+                    print("FIRST ROW:", str(data[0])[:500])
+
             else:
                 print("SAMPLE:", str(data)[:300])
 
         except ValueError:
-            print("BODY:", response.text[:300])
+            print("BODY:", response.text[:250])
 
     except requests.RequestException as error:
-        print("REQUEST ERROR:", str(error)[:300])
+        print("REQUEST ERROR:", str(error)[:250])
 
-print("\nTEST FINISHED")
-print("No orders were sent.")
+print("\nTEST COMPLETE")
+print("No trading orders were sent.")
