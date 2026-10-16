@@ -1,183 +1,180 @@
 
 import os
-import time
 import logging
+import requests
 from datetime import datetime, timezone
 
-import requests
-
-# ETH WHALE - TREND ONLY
-# No real orders
+# ============================================================
+# ETH WHALE - CRYPTO MARKET TREND REPORT
+# TREND REPORT ONLY | NO BUY/SELL SIGNALS | NO REAL ORDERS
+# ============================================================
 
 BOT_NAME = "🐋 ETH WHALE"
 
 BINANCE_BASE = "https://data-api.binance.vision"
 BYBIT_BASE = "https://api.bybit.com"
 
-MAX_MARKETS = 25
-MIN_VOLUME_USDT = 2_000_000
-CANDLE_LIMIT = 100
-
-TIMEFRAMES = [
-    ("15m", "15"),
-    ("1h", "60"),
-    ("4h", "240"),
-]
-
 TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    or os.getenv("TELEGRAM_TOKEN", "").strip()
-)
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN", "")
+).strip()
 
-TELEGRAM_CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    or os.getenv("CHAT_ID", "").strip()
-)
+CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID")
+    or os.getenv("CHAT_ID", "")
+).strip()
+
+TIMEFRAMES = ["15m", "1h", "4h"]
+MAX_MARKETS = 25
+CANDLE_LIMIT = 100
+REQUEST_TIMEOUT = 20
+
+HEADERS = {"User-Agent": "ETH-WHALE-TrendBot/1.0"}
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-SESSION = requests.Session()
+session = requests.Session()
+session.headers.update(HEADERS)
 
 
 def get_json(url, params=None):
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            response = SESSION.get(
-                url,
-                params=params,
-                timeout=15,
-            )
-            response.raise_for_status()
-            return response.json()
-
-        except Exception as exc:
-            last_error = exc
-            time.sleep(attempt + 1)
-
-    raise RuntimeError(str(last_error))
+    response = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(message)
-        logging.error("Telegram secrets missing")
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.error("Telegram token or chat ID is missing.")
         return False
 
     url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendMessage"
     )
 
-    for start in range(0, len(message), 3800):
-        response = SESSION.post(
+    try:
+        response = session.post(
             url,
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message[start:start + 3800],
-                "disable_web_page_preview": True,
+                "chat_id": CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True
             },
-            timeout=15,
+            timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
+        result = response.json()
 
-        if not response.json().get("ok"):
-            raise RuntimeError("Telegram send failed")
+        if not result.get("ok"):
+            logging.error("Telegram API returned ok=false.")
+            return False
 
-    return True
+        logging.info("Telegram message sent.")
+        return True
+
+    except Exception as exc:
+        logging.error("Telegram error: %s", exc)
+        return False
 
 
 def excluded_symbol(symbol):
-    if not symbol.endswith("USDT"):
-        return True
-
-    base = symbol[:-4]
-
-    stablecoins = {
-        "USDC", "FDUSD", "TUSD", "USDP",
-        "DAI", "USDE", "USDD", "PYUSD",
-        "BUSD", "USTC", "USDS", "USD1",
-    }
-
-    if base in stablecoins:
-        return True
-
-    return base.endswith(("UP", "DOWN", "BULL", "BEAR"))
-
-def binance_markets():
-    data = get_json(
-        f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    excluded_suffixes = (
+        "UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"
     )
 
-    if not isinstance(data, list):
-        raise RuntimeError("Invalid Binance ticker response")
+    return (
+        not symbol.endswith("USDT")
+        or any(symbol.endswith(s) for s in excluded_suffixes)
+    )
 
-    markets = []
 
-    for item in data:
+# ---------------- BINANCE MARKET DATA ----------------
+
+def binance_markets():
+    info = get_json(f"{BINANCE_BASE}/api/v3/exchangeInfo")
+    valid = set()
+
+    for item in info.get("symbols", []):
         symbol = item.get("symbol", "")
 
-        if excluded_symbol(symbol):
+        if (
+            item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("isSpotTradingAllowed", True)
+            and not excluded_symbol(symbol)
+        ):
+            valid.add(symbol)
+
+    tickers = get_json(f"{BINANCE_BASE}/api/v3/ticker/24hr")
+    ranked = []
+
+    for item in tickers:
+        symbol = item.get("symbol", "")
+
+        if symbol not in valid:
             continue
 
         try:
-            price = float(item["lastPrice"])
-            volume = float(item["quoteVolume"])
-            change = float(item["priceChangePercent"])
-        except (ValueError, TypeError, KeyError):
+            volume = float(item.get("quoteVolume", 0))
+        except (TypeError, ValueError):
             continue
 
-        if price <= 0 or volume < MIN_VOLUME_USDT:
-            continue
+        if volume > 0:
+            ranked.append((symbol, volume))
 
-        markets.append({
-            "symbol": symbol,
-            "price": price,
-            "volume": volume,
-            "change": change,
-        })
-
-    markets.sort(
-        key=lambda item: item["volume"],
-        reverse=True,
-    )
-
-    return markets[:MAX_MARKETS]
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return [symbol for symbol, _ in ranked[:MAX_MARKETS]]
 
 
-def binance_candles(symbol, interval):
+def binance_candles(symbol, timeframe, limit=CANDLE_LIMIT):
+    # Binance requires values such as 15m, 1h and 4h.
+    interval_map = {
+        "15": "15m", "15m": "15m",
+        "60": "1h", "1h": "1h",
+        "240": "4h", "4h": "4h"
+    }
+
+    interval = interval_map.get(str(timeframe), str(timeframe))
+
+    if interval not in ("15m", "1h", "4h"):
+        raise ValueError(f"Invalid Binance interval: {timeframe}")
+
     data = get_json(
         f"{BINANCE_BASE}/api/v3/klines",
-        params={
+        {
             "symbol": symbol,
             "interval": interval,
-            "limit": CANDLE_LIMIT,
-        },
+            "limit": limit
+        }
     )
 
-    if not isinstance(data, list) or len(data) < 55:
-        raise RuntimeError("Insufficient Binance candles")
+    if not isinstance(data, list) or len(data) < 50:
+        raise ValueError(f"Not enough Binance candles: {symbol}")
 
-    # Ignore the latest candle because it may be incomplete.
-    return [float(row[4]) for row in data[:-1]]
+    return data
 
+
+# ---------------- BYBIT FALLBACK DATA ----------------
 
 def bybit_markets():
     data = get_json(
         f"{BYBIT_BASE}/v5/market/tickers",
-        params={"category": "spot"},
+        {"category": "spot"}
     )
 
     if data.get("retCode") != 0:
-        raise RuntimeError(
-            data.get("retMsg", "Bybit ticker error")
-        )
+        raise ValueError(data.get("retMsg", "Bybit ticker error"))
 
-    markets = []
+    ranked = []
 
     for item in data.get("result", {}).get("list", []):
         symbol = item.get("symbol", "")
@@ -186,84 +183,97 @@ def bybit_markets():
             continue
 
         try:
-            price = float(item["lastPrice"])
-            volume = float(item["turnover24h"])
-            change = float(item["price24hPcnt"]) * 100
-        except (ValueError, TypeError, KeyError):
+            volume = float(item.get("turnover24h", 0))
+        except (TypeError, ValueError):
             continue
 
-        if price <= 0 or volume < MIN_VOLUME_USDT:
-            continue
+        if volume > 0:
+            ranked.append((symbol, volume))
 
-        markets.append({
-            "symbol": symbol,
-            "price": price,
-            "volume": volume,
-            "change": change,
-        })
-
-    markets.sort(
-        key=lambda item: item["volume"],
-        reverse=True,
-    )
-
-    return markets[:MAX_MARKETS]
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return [symbol for symbol, _ in ranked[:MAX_MARKETS]]
 
 
-def bybit_candles(symbol, interval):
+def bybit_candles(symbol, timeframe, limit=CANDLE_LIMIT):
+    interval_map = {
+        "15m": "15", "15": "15",
+        "1h": "60", "60": "60",
+        "4h": "240", "240": "240"
+    }
+
+    interval = interval_map.get(str(timeframe), str(timeframe))
+
+    if interval not in ("15", "60", "240"):
+        raise ValueError(f"Invalid Bybit interval: {timeframe}")
+
     data = get_json(
         f"{BYBIT_BASE}/v5/market/kline",
-        params={
+        {
             "category": "spot",
             "symbol": symbol,
             "interval": interval,
-            "limit": CANDLE_LIMIT,
-        },
+            "limit": limit
+        }
     )
 
     if data.get("retCode") != 0:
-        raise RuntimeError(
-            data.get("retMsg", "Bybit candle error")
-        )
+        raise ValueError(data.get("retMsg", "Bybit kline error"))
 
-    rows = data.get("result", {}).get("list", [])
-    rows = list(reversed(rows))
+    candles = data.get("result", {}).get("list", [])
+    candles = list(reversed(candles))
 
-    if len(rows) < 55:
-        raise RuntimeError("Insufficient Bybit candles")
+    if len(candles) < 50:
+        raise ValueError(f"Not enough Bybit candles: {symbol}")
 
-    # Exclude the latest potentially incomplete candle.
-    return [float(row[4]) for row in rows[:-1]]
+    return candles
 
-def ema(values, period):
+
+# ---------------- TECHNICAL INDICATORS ----------------
+
+def extract_closes(candles):
+    closes = []
+
+    for candle in candles:
+        try:
+            closes.append(float(candle[4]))
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    if len(closes) < 50:
+        raise ValueError("Not enough valid closing prices")
+
+    return closes
+
+
+def calculate_ema(values, period):
     if len(values) < period:
-        raise ValueError("Not enough data for EMA")
+        raise ValueError("Not enough values for EMA")
 
-    alpha = 2 / (period + 1)
-    result = sum(values[:period]) / period
+    ema = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
 
     for value in values[period:]:
-        result = alpha * value + (1 - alpha) * result
+        ema = value * multiplier + ema * (1 - multiplier)
 
-    return result
+    return ema
 
 
-def rsi(values, period=14):
+def calculate_rsi(values, period=14):
+    if len(values) <= period:
+        raise ValueError("Not enough values for RSI")
+
     changes = [
         values[i] - values[i - 1]
         for i in range(1, len(values))
     ]
 
-    if len(changes) < period:
-        return 50.0
-
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    for i in range(period, len(changes)):
+    for i in range(period, len(gains)):
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
@@ -279,265 +289,200 @@ def rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def classify(closes):
-    fast = ema(closes, 20)
-    slow = ema(closes, 50)
-    price = closes[-1]
-    momentum = rsi(closes)
+def analyze_candles(candles):
+    closes = extract_closes(candles)
 
-    if fast > slow and price > fast:
-        if momentum >= 55:
-            label, score = "🟢 صعودی", 2
-        else:
-            label, score = "🟡 صعود ضعیف", 1
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    rsi = calculate_rsi(closes, 14)
+    last_price = closes[-1]
 
-    elif fast < slow and price < fast:
-        if momentum <= 45:
-            label, score = "🔴 نزولی", -2
-        else:
-            label, score = "🟡 نزول ضعیف", -1
-
+    if ema20 > ema50 and last_price > ema20:
+        trend = "صعودی"
+    elif ema20 < ema50 and last_price < ema20:
+        trend = "نزولی"
     else:
-        label, score = "🟡 خنثی", 0
+        trend = "خنثی / در حال نوسان"
+
+    if rsi >= 70:
+        rsi_status = "بالا؛ احتمال اشباع خرید"
+    elif rsi <= 30:
+        rsi_status = "پایین؛ احتمال اشباع فروش"
+    else:
+        rsi_status = "در محدوده میانی"
 
     return {
-        "label": label,
-        "score": score,
-        "rsi": momentum,
+        "price": last_price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "trend": trend,
+        "rsi_status": rsi_status
     }
 
 
-def format_price(price):
-    if price >= 1000:
-        return f"{price:,.2f}"
+# ---------------- REPORT CREATION ----------------
 
-    if price >= 1:
-        return f"{price:.4f}".rstrip("0").rstrip(".")
-
-    return f"{price:.8f}".rstrip("0").rstrip(".")
-
-
-def analyze(markets, candle_function):
+def analyze_market(symbol):
     results = []
+    sources_used = set()
 
-    for market in markets:
-        result = dict(market)
-        result["trends"] = {}
+    for timeframe in TIMEFRAMES:
+        analysis = None
+        last_error = None
 
-        for timeframe, interval in TIMEFRAMES:
+        # Try Binance first, then Bybit.
+        for source in ("Binance", "Bybit"):
             try:
-                closes = candle_function(
-                    market["symbol"], interval
-                )
+                if source == "Binance":
+                    candles = binance_candles(symbol, timeframe)
+                else:
+                    candles = bybit_candles(symbol, timeframe)
 
-                result["trends"][timeframe] = classify(closes)
+                analysis = analyze_candles(candles)
+                sources_used.add(source)
+                break
 
             except Exception as exc:
+                last_error = exc
                 logging.warning(
-                    "%s %s: %s",
-                    market["symbol"], timeframe, exc
+                    "%s %s %s error: %s",
+                    symbol, timeframe, source, exc
                 )
 
-            time.sleep(0.1)
+        if analysis is None:
+            results.append(
+                f"  {timeframe}: داده دریافت نشد"
+            )
+            continue
 
-        if result["trends"]:
-            results.append(result)
+        results.append(
+            f"  ⏱ {timeframe}\n"
+            f"  روند: {analysis['trend']}\n"
+            f"  قیمت آخر: {analysis['price']:.8g}\n"
+            f"  EMA20: {analysis['ema20']:.8g}\n"
+            f"  EMA50: {analysis['ema50']:.8g}\n"
+            f"  RSI14: {analysis['rsi']:.1f} "
+            f"({analysis['rsi_status']})"
+        )
 
-    return results
-
-
-def overall_trend(results):
-    scores = [
-        item["trends"]["1h"]["score"]
-        for item in results
-        if "1h" in item["trends"]
-    ]
-
-    if not scores:
-        return "⚪ اطلاعات کافی برای تعیین روند وجود ندارد."
-
-    bullish = sum(score > 0 for score in scores)
-    bearish = sum(score < 0 for score in scores)
-    neutral = len(scores) - bullish - bearish
-    total = len(scores)
-
-    if bullish / total >= 0.60:
-        mood = "🟢 تمایل کلی بازار صعودی"
-    elif bearish / total >= 0.60:
-        mood = "🔴 تمایل کلی بازار نزولی"
-    else:
-        mood = "🟡 بازار ترکیبی یا خنثی"
-
-    return (
-        f"{mood}\n"
-        f"🟢 صعودی: {bullish}/{total}\n"
-        f"🔴 نزولی: {bearish}/{total}\n"
-        f"🟡 خنثی: {neutral}/{total}"
-    )
+    return results, sources_used
 
 
-def build_report(results, source):
-    now = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
+def build_report(markets):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        BOT_NAME,
+        f"{BOT_NAME}",
         "━━━━━━━━━━━━━━━━━━",
-        "📊 گزارش روند بازار کریپتو",
-        "🧪 فقط تحلیل بازار؛ بدون معامله",
-        f"📡 منبع: {source}",
+        "📊 گزارش روند بازار رمزارزها",
+        "🧪 تحلیل اطلاعات بازار؛ بدون معامله",
         f"🕒 زمان: {now}",
-        "━━━━━━━━━━━━━━━━━━",
-        "🌐 وضعیت کلی بازار",
-        overall_trend(results),
-        "",
+        f"🔎 تعداد بازارها: {len(markets)}",
+        "━━━━━━━━━━━━━━━━━━"
     ]
 
-    btc = next(
-        (x for x in results if x["symbol"] == "BTCUSDT"),
-        None,
-    )
+    sources = set()
+    successful_markets = 0
 
-    if btc:
-        lines.extend([
-            "₿ بیت‌کوین",
-            f"💵 قیمت: {format_price(btc['price'])} USDT",
-            f"📈 تغییر ۲۴ساعته: {btc['change']:+.2f}%",
-        ])
+    for symbol in markets:
+        try:
+            details, used_sources = analyze_market(symbol)
+            sources.update(used_sources)
 
-        for timeframe, _ in TIMEFRAMES:
-            trend = btc["trends"].get(timeframe)
+            if any("داده دریافت نشد" not in item for item in details):
+                successful_markets += 1
 
-            if trend:
-                lines.append(
-                    f"{timeframe}: {trend['label']} "
-                    f"| RSI {trend['rsi']:.0f}"
-                )
+            lines.append(f"\n💠 {symbol}")
+            lines.extend(details)
 
-        lines.append("")
-
-    hourly = [
-        x for x in results if "1h" in x["trends"]
-    ]
-
-    bullish = sorted(
-        [x for x in hourly if x["trends"]["1h"]["score"] > 0],
-        key=lambda x: (
-            x["trends"]["1h"]["score"],
-            x["trends"].get("4h", {}).get("score", 0),
-            x["change"],
-        ),
-        reverse=True,
-    )
-
-    bearish = sorted(
-        [x for x in hourly if x["trends"]["1h"]["score"] < 0],
-        key=lambda x: (
-            x["trends"]["1h"]["score"],
-            x["trends"].get("4h", {}).get("score", 0),
-            x["change"],
-        ),
-    )
-
-    lines.append("🟢 ارزهای دارای روند صعودی | ۱ساعته")
-
-    if bullish:
-        for item in bullish[:8]:
-            lines.append(
-                f"• {item['symbol']} | "
-                f"{format_price(item['price'])} USDT | "
-                f"۲۴ساعت {item['change']:+.2f}%"
-            )
-
-            trend4 = item["trends"].get("4h")
-
-            if trend4:
-                lines.append(f"  روند ۴ساعته: {trend4['label']}")
-    else:
-        lines.append("موردی شناسایی نشد.")
+        except Exception as exc:
+            logging.warning("Market analysis failed for %s: %s", symbol, exc)
+            lines.append(f"\n💠 {symbol}\n  خطا در تحلیل")
 
     lines.extend([
-        "",
-        "🔴 ارزهای دارای روند نزولی | ۱ساعته",
-    ])
-
-    if bearish:
-        for item in bearish[:8]:
-            lines.append(
-                f"• {item['symbol']} | "
-                f"{format_price(item['price'])} USDT | "
-                f"۲۴ساعت {item['change']:+.2f}%"
-            )
-
-            trend4 = item["trends"].get("4h")
-
-            if trend4:
-                lines.append(f"  روند ۴ساعته: {trend4['label']}")
-    else:
-        lines.append("موردی شناسایی نشد.")
-
-    lines.extend([
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "ℹ️ گزارش روند است، نه توصیه خرید یا فروش.",
+        "\n━━━━━━━━━━━━━━━━━━",
+        f"✅ بازارهای دارای داده: {successful_markets}",
+        "📚 منبع: " + (", ".join(sorted(sources)) if sources else "نامشخص"),
         "🚫 سفارش واقعی: غیرفعال",
+        "ℹ️ این گزارش توصیه خرید یا فروش نیست."
     ])
 
-    return "\n".join(lines)
+    # Telegram messages have a practical text length limit.
+    report = "\n".join(lines)
+    max_length = 3800
 
+    if len(report) <= max_length:
+        return [report]
+
+    chunks = []
+    current = ""
+
+    for line in lines:
+        candidate = current + ("\n" if current else "") + line
+
+        if len(candidate) > max_length:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    total = len(chunks)
+    return [
+        f"📄 بخش {i + 1}/{total}\n{chunk}"
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+# ---------------- MAIN ----------------
 
 def main():
+    logging.info("Starting %s", BOT_NAME)
+
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        raise RuntimeError(
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "in GitHub repository Actions secrets."
+        )
+
     try:
         markets = binance_markets()
-        source = "Binance Public Data"
-        candle_function = binance_candles
-
+        logging.info("Binance markets loaded: %d", len(markets))
     except Exception as exc:
-        logging.warning("Binance unavailable: %s", exc)
+        logging.warning("Binance market list failed: %s", exc)
 
         try:
             markets = bybit_markets()
-            source = "Bybit Public API (fallback)"
-            candle_function = bybit_candles
-
+            logging.info("Bybit fallback markets loaded: %d", len(markets))
         except Exception as fallback_exc:
-            message = (
+            logging.exception("Both market sources failed.")
+            send_telegram(
                 f"{BOT_NAME}\n"
-                "❌ دریافت اطلاعات بازار ناموفق بود.\n"
-                f"Binance: {str(exc)[:200]}\n"
-                f"Bybit: {str(fallback_exc)[:200]}\n"
-                "هیچ روندی حدس زده نشده است."
+                "❌ دریافت فهرست بازارها ناموفق بود.\n"
+                f"Binance: {str(exc)[:300]}\n"
+                f"Bybit: {str(fallback_exc)[:300]}\n"
+                "🧪 هیچ سفارش واقعی ثبت نشده است."
             )
-
-            send_telegram(message)
-            raise RuntimeError(
-                "Both market data sources failed"
-            ) from fallback_exc
+            raise
 
     if not markets:
-        raise RuntimeError("No eligible USDT markets found")
+        raise RuntimeError("No eligible USDT spot markets found.")
 
-    logging.info("Markets selected: %d", len(markets))
+    reports = build_report(markets)
 
-    results = analyze(markets, candle_function)
+    all_sent = True
+    for report in reports:
+        if not send_telegram(report):
+            all_sent = False
 
-    if not results:
-        message = (
-            f"{BOT_NAME}\n"
-            "❌ کندل کافی برای تحلیل دریافت نشد."
-        )
+    if not all_sent:
+        raise RuntimeError("One or more Telegram messages failed.")
 
-        send_telegram(message)
-        raise RuntimeError("No markets analyzed")
-
-    report = build_report(results, source)
-    send_telegram(report)
-
-    logging.info(
-        "Completed: %d markets analyzed",
-        len(results),
-    )
+    logging.info("Trend report completed successfully.")
 
 
 if __name__ == "__main__":
