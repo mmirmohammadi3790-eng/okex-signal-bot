@@ -1,237 +1,344 @@
 
+# -*- coding: utf-8 -*-
+"""
+IRAN STOCK WHALE
+Iran Bourse + Farabourse
+Telegram alerts | Paper trading only
+NO REAL ORDERS
+"""
+
 import os
+import json
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ============================================================
-# ETH WHALE | BITPIN FUTURES SIGNAL SCANNER
-# PAPER ONLY - NO REAL ORDERS
+# CONFIGURATION
 # ============================================================
 
-BASE_URL = "https://api.bitpin.org"
-CAPITAL_USDT = 48.0
-LEVERAGE = 3
-MARGIN_USDT = 8.0
-MAX_SIGNALS = 3
-MIN_SCORE = 75
-CANDLE_COUNT = 150
-TIMEOUT = 20
+BOT_NAME = "IRAN STOCK WHALE"
+BASE_URL = "https://cdn.tsetmc.com/api"
+TELEGRAM_API = "https://api.telegram.org"
+
+CAPITAL_TOMAN = 10_000_000
+RISK_PERCENT = 1.0
+MAX_POSITION_PERCENT = 20.0
+
+MIN_SCORE = 70
+MAX_SIGNALS_PER_SCAN = 10
+MAX_SYMBOLS_PER_SCAN = 0  # 0 = all received symbols
+REQUEST_DELAY = 0.6
+RETRY_COUNT = 3
+
+STATE_FILE = "bot_state.json"
+LOG_FILE = "bot.log"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+CAPITAL_RIAL = CAPITAL_TOMAN * 10
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
-
-session = requests.Session()
-session.headers.update({"User-Agent": "ETH-WHALE-PaperBot/1.0"})
+log = logging.getLogger(BOT_NAME)
 
 
-def get_json(path, params=None):
-    url = BASE_URL + path
-    response = session.get(url, params=params, timeout=TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+# ============================================================
+# TIME AND FORMATTING
+# ============================================================
+
+def iran_now():
+    return datetime.now(ZoneInfo("Asia/Tehran"))
 
 
-def telegram_send(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("Telegram secrets missing; report printed only.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    response = requests.post(
-        url,
-        json={"chat_id": CHAT_ID, "text": text},
-        timeout=TIMEOUT
-    )
-    response.raise_for_status()
-
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram rejected message")
-
-
-def as_float(value):
+def fa_num(value, decimals=0):
     try:
-        result = float(value)
-        if result == result and abs(result) != float("inf"):
-            return result
-    except (TypeError, ValueError):
-        pass
-    return None
+        s = f"{float(value):,.{decimals}f}"
+        return s.translate(
+            str.maketrans("0123456789.,-", "۰۱۲۳۴۵۶۷۸۹٫٬−")
+        )
+    except (ValueError, TypeError):
+        return str(value)
 
 
-def rows_from_response(data, keys=()):
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        for key in keys:
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-
-        for value in data.values():
-            if isinstance(value, list):
-                return value
-
-    return []
+def price_text(value):
+    return f"{fa_num(value)} ریال"
 
 
-def market_symbol(item):
-    for key in ("symbol", "code", "market_symbol"):
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().upper().replace("-", "_")
-    return ""
+# ============================================================
+# HTTP AND TELEGRAM
+# ============================================================
+
+def api_get(path, params=None):
+    url = BASE_URL + path
+    last_error = None
+
+    for attempt in range(RETRY_COUNT):
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=(10, 30),
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise ValueError("Unexpected API response format")
+
+            return data
+
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            log.warning(
+                "API attempt %s failed: %s",
+                attempt + 1,
+                exc,
+            )
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(f"TSETMC API unavailable: {last_error}")
 
 
-def market_type_text(item):
-    keys = (
-        "type", "market_type", "category", "instrument_type",
-        "contract_type", "product_type", "market"
-    )
-    values = []
-    for key in keys:
-        value = item.get(key)
-        if isinstance(value, (str, int)):
-            values.append(str(value).lower())
-    return " ".join(values)
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("Telegram credentials are missing.")
+        return False
 
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage"
 
-def explicitly_futures(item):
-    """
-    Fail closed: accept only metadata explicitly identifying
-    a futures, perpetual, swap, or derivative instrument.
-    Do not infer futures from a USDT symbol alone.
-    """
-    text = market_type_text(item)
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
 
-    explicit_true_keys = (
-        "is_futures", "is_future", "is_perpetual",
-        "is_derivative", "futures_enabled"
-    )
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(str(result))
 
-    for key in explicit_true_keys:
-        if item.get(key) is True:
-            return True
-
-    if any(word in text for word in (
-        "futures", "future", "perpetual", "derivative", "swap"
-    )):
         return True
 
-    return False
+    except Exception:
+        log.exception("Telegram message failed")
+        return False
 
 
-def load_markets():
-    errors = []
+# ============================================================
+# PERSISTENT STATE
+# ============================================================
 
-    for path in (
-        "/api/v1/mkt/markets/",
-        "/v1/mkt/markets/"
-    ):
-        try:
-            data = get_json(path)
-            rows = rows_from_response(data, ("results", "markets"))
-
-            if rows:
-                logging.info("Loaded %s markets from %s", len(rows), path)
-                return rows
-
-            errors.append(f"{path}: empty/unrecognized response")
-
-        except Exception as exc:
-            errors.append(f"{path}: {exc}")
-
-    raise RuntimeError("Could not load market list: " + " | ".join(errors))
-
-
-def load_candles(symbol, resolution, count=CANDLE_COUNT):
-    now = int(time.time())
-
-    seconds_per_candle = {
-        "15m": 15 * 60,
-        "1h": 60 * 60
+def load_state():
+    default = {
+        "sent": {},
+        "paper_trades": [],
+        "last_scan": None,
     }
 
-    if resolution not in seconds_per_candle:
-        raise ValueError("Unsupported timeframe: " + resolution)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
 
-    start = now - seconds_per_candle[resolution] * count
+        if not isinstance(state, dict):
+            return default
 
-    data = get_json(
-        "/api/v1/mkt/candles/",
-        params={
-            "symbol": symbol,
-            "from": start,
-            "to": now,
-            "res": resolution
-        }
+        state.setdefault("sent", {})
+        state.setdefault("paper_trades", [])
+        state.setdefault("last_scan", None)
+        return state
+
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_state(state):
+    temp = STATE_FILE + ".tmp"
+
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    os.replace(temp, STATE_FILE)
+
+
+# ============================================================
+# MARKET WATCH
+# ============================================================
+
+def as_float(row, *keys):
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                continue
+    return 0.0
+
+
+def get_market_watch():
+    params = {
+        "market": 0,
+        "paperTypes[0]": 1,
+        "paperTypes[1]": 2,
+        "paperTypes[2]": 3,
+        "paperTypes[3]": 4,
+        "paperTypes[4]": 5,
+        "paperTypes[5]": 6,
+        "paperTypes[6]": 7,
+        "paperTypes[7]": 8,
+        "paperTypes[8]": 9,
+        "withBestLimits": "false",
+        "hEven": 0,
+        "RefID": 0,
+    }
+
+    data = api_get(
+        "/ClosingPrice/GetMarketWatch",
+        params=params,
     )
 
-    if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected candles response for {symbol}")
+    rows = data.get("marketwatch")
 
-    candles = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+    if isinstance(rows, dict):
+        rows = rows.get("marketwatch", rows.get("data"))
 
-        try:
-            candle = {
-                "open": float(item["open"]),
-                "close": float(item["close"]),
-                "high": float(item["high"]),
-                "low": float(item["low"]),
-                "volume": float(item["volume"]),
-                "ts": float(item["ts"]),
-                "resolution": str(item.get("resolution", ""))
-            }
-        except (KeyError, TypeError, ValueError):
-            continue
-
-        if candle["close"] > 0 and candle["high"] > 0:
-            candles.append(candle)
-
-    candles.sort(key=lambda x: x["ts"])
-
-    # Verify API actually returned the requested resolution.
-    if any(c["resolution"] and c["resolution"] != resolution
-           for c in candles):
+    if not isinstance(rows, list):
         raise RuntimeError(
-            f"API returned an unexpected timeframe for {symbol}/{resolution}"
+            "Market-watch response did not contain a symbol list"
         )
 
-    if len(candles) < 60:
-        raise RuntimeError(
-            f"Not enough candles for {symbol}/{resolution}: {len(candles)}"
-        )
+    result = []
 
-    # Exclude the currently forming candle from indicator calculations.
-    return candles[:-1]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
 
+        code = row.get("insCode")
+        symbol = row.get("lVal18AFC")
 
-def ema(values, period):
-    if len(values) < period:
-        return None
+        if not code or not symbol:
+            continue
 
-    seed = sum(values[:period]) / period
-    alpha = 2.0 / (period + 1.0)
-    result = seed
+        last = as_float(row, "pDrCotVal", "pl")
+        close = as_float(row, "pClosing", "pc")
+        yesterday = as_float(row, "priceYesterday", "py")
+        volume = as_float(row, "qTotTran5J", "tvol")
+        value = as_float(row, "qTotCap", "tval")
 
-    for value in values[period:]:
-        result = value * alpha + result * (1.0 - alpha)
+        if last <= 0 or close <= 0:
+            continue
+
+        result.append({
+            "code": str(code),
+            "symbol": str(symbol).strip(),
+            "name": str(row.get("lVal30") or symbol).strip(),
+            "last": last,
+            "close": close,
+            "yesterday": yesterday,
+            "volume": volume,
+            "value": value,
+        })
+
+    result.sort(key=lambda x: x["value"], reverse=True)
+
+    if MAX_SYMBOLS_PER_SCAN > 0:
+        result = result[:MAX_SYMBOLS_PER_SCAN]
 
     return result
 
 
-def rsi(values, period=14):
-    if len(values) <= period:
+# ============================================================
+# DAILY PRICE HISTORY
+# ============================================================
+
+def get_daily_history(ins_code):
+    data = api_get(
+        f"/ClosingPrice/GetClosingPriceDailyList/{ins_code}/60"
+    )
+
+    rows = data.get("closingPriceDaily")
+
+    if not isinstance(rows, list):
+        return []
+
+    rows = sorted(
+        rows,
+        key=lambda row: str(row.get("dEven", "")),
+    )
+
+    history = []
+
+    for row in rows:
+        close = as_float(row, "pClosing", "pDrCotVal")
+        volume = as_float(row, "qTotTran5J")
+
+        if close > 0:
+            history.append({
+                "date": str(row.get("dEven", "")),
+                "close": close,
+                "volume": volume,
+            })
+
+    # Remove duplicate dates and retain chronological order.
+    unique = {}
+
+    for item in history:
+        unique[item["date"]] = item
+
+    return sorted(
+        unique.values(),
+        key=lambda item: item["date"],
+    )
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_ema(values, period):
+    if len(values) < period:
+        return None
+
+    result = sum(values[:period]) / period
+    alpha = 2 / (period + 1)
+
+    for value in values[period:]:
+        result = alpha * value + (1 - alpha) * result
+
+    return result
+
+
+def calculate_rsi(values, period=14):
+    if len(values) < period + 1:
         return None
 
     changes = [
@@ -239,327 +346,334 @@ def rsi(values, period=14):
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0.0) for x in changes]
-    losses = [max(-x, 0.0) for x in changes]
+    recent = changes[-period:]
+    gains = [max(x, 0) for x in recent]
+    losses = [max(-x, 0) for x in recent]
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - (100 / (1 + rs))
 
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
+def calculate_volatility(closes, period=14):
+    """
+    Close-to-close volatility proxy.
+    Not a true ATR because intraday high/low candles are not used.
+    """
+    if len(closes) < period + 1:
         return None
 
-    true_ranges = []
-    for i in range(1, len(candles)):
-        current = candles[i]
-        previous_close = candles[i - 1]["close"]
+    changes = [
+        abs(closes[i] - closes[i - 1])
+        for i in range(1, len(closes))
+    ]
 
-        true_ranges.append(max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close)
-        ))
-
-    return sum(true_ranges[-period:]) / period
+    return sum(changes[-period:]) / period
 
 
-def analyze_timeframe(candles):
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
 
-    fast = ema(closes, 20)
-    slow = ema(closes, 50)
-    current_rsi = rsi(closes, 14)
-    current_atr = atr(candles, 14)
-
-    if None in (fast, slow, current_rsi, current_atr):
-        raise RuntimeError("Indicator calculation failed")
-
-    recent_volume = sum(volumes[-5:]) / 5
-    previous_volume = sum(volumes[-25:-5]) / 20
-    volume_ratio = (
-        recent_volume / previous_volume
-        if previous_volume > 0 else 0
-    )
-
-    recent = candles[-20:]
-    support = min(c["low"] for c in recent)
-    resistance = max(c["high"] for c in recent)
-    price = closes[-1]
-
-    return {
-        "price": price,
-        "ema20": fast,
-        "ema50": slow,
-        "rsi": current_rsi,
-        "atr": current_atr,
-        "volume_ratio": volume_ratio,
-        "support": support,
-        "resistance": resistance,
-        "trend": (
-            "LONG" if fast > slow and price > fast
-            else "SHORT" if fast < slow and price < fast
-            else "NEUTRAL"
-        )
-    }
-
-
-def analyze_symbol(symbol, btc_trend):
-    candles15 = load_candles(symbol, "15m")
-    candles1h = load_candles(symbol, "1h")
-
-    a15 = analyze_timeframe(candles15)
-    a1h = analyze_timeframe(candles1h)
-
-    if a15["trend"] == "NEUTRAL" or a1h["trend"] == "NEUTRAL":
+def analyze_symbol(symbol, history):
+    if len(history) < 50:
         return None
 
-    if a15["trend"] != a1h["trend"]:
+    closes = [x["close"] for x in history]
+    volumes = [x["volume"] for x in history]
+
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    rsi_value = calculate_rsi(closes, 14)
+    volatility = calculate_volatility(closes)
+
+    if any(
+        x is None
+        for x in (ema20, ema50, rsi_value, volatility)
+    ):
         return None
 
-    direction = a15["trend"]
+    price = symbol["last"]
 
-    # Conservative RSI and volume filters.
-    if direction == "LONG":
-        if not (50 <= a15["rsi"] <= 68):
-            return None
-        if not (48 <= a1h["rsi"] <= 70):
-            return None
-        if btc_trend == "SHORT":
-            return None
-    else:
-        if not (32 <= a15["rsi"] <= 50):
-            return None
-        if not (30 <= a1h["rsi"] <= 52):
-            return None
-        if btc_trend == "LONG":
-            return None
-
-    if a15["volume_ratio"] < 1.15:
+    if price <= 0 or volatility <= 0:
         return None
 
-    price = a15["price"]
-    volatility = a15["atr"]
+    score = 0
+    reasons = []
 
-    if volatility <= 0 or price <= 0:
-        return None
+    # Trend
+    if ema20 > ema50:
+        score += 25
+        reasons.append("EMA20 بالاتر از EMA50")
 
-    # Avoid entries too close to the opposing level.
-    if direction == "LONG":
-        if a15["resistance"] > price:
-            room = a15["resistance"] - price
-            if room < 1.5 * volatility:
-                return None
-        stop = max(a15["support"], price - 1.5 * volatility)
-        risk = price - stop
-        if risk <= 0:
+    # Price momentum
+    if price > ema20:
+        score += 20
+        reasons.append("قیمت بالاتر از EMA20")
+
+    # RSI
+    if 50 <= rsi_value <= 68:
+        score += 20
+        reasons.append("RSI در محدوده مثبت")
+
+    # Volume confirmation
+    if len(volumes) >= 21:
+        baseline = volumes[-21:-1]
+        avg_volume = sum(baseline) / len(baseline)
+
+        if avg_volume > 0 and symbol["volume"] >= avg_volume * 1.2:
+            score += 20
+            reasons.append("حجم جاری بالاتر از میانگین")
+
+    # Daily price movement filter
+    if symbol["yesterday"] > 0:
+        change_pct = (
+            (price - symbol["yesterday"])
+            / symbol["yesterday"]
+        ) * 100
+
+        if 0 < change_pct <= 3:
+            score += 15
+            reasons.append("رشد روزانه کنترل‌شده")
+
+        if change_pct > 4:
             return None
-        target1 = price + 2.0 * risk
-        target2 = price + 3.0 * risk
-    else:
-        if a15["support"] < price:
-            room = price - a15["support"]
-            if room < 1.5 * volatility:
-                return None
-        stop = min(a15["resistance"], price + 1.5 * volatility)
-        risk = stop - price
-        if risk <= 0:
-            return None
-        target1 = price - 2.0 * risk
-        target2 = price - 3.0 * risk
-
-    score = 75
-
-    if a15["volume_ratio"] >= 1.5:
-        score += 5
-
-    if direction == a1h["trend"]:
-        score += 5
-
-    # BTC alignment is required to pass; alignment adds confidence.
-    if btc_trend == direction:
-        score += 5
 
     if score < MIN_SCORE:
         return None
 
-    # Educational risk estimate only; no exchange contract sizing here.
-    assumed_notional = MARGIN_USDT * LEVERAGE
-    assumed_quantity = assumed_notional / price
-    risk_percent = abs(price - stop) / price * 100
+    # Stop and targets in Rial
+    stop_distance = max(
+        volatility * 1.5,
+        price * 0.015,
+    )
+    stop_distance = min(stop_distance, price * 0.04)
+
+    entry = price
+    stop = entry - stop_distance
+
+    if stop <= 0 or stop >= entry:
+        return None
+
+    tp1 = entry + stop_distance * 1.5
+    tp2 = entry + stop_distance * 2.0
+    tp3 = entry + stop_distance * 3.0
+
+    # Correct unit conversion:
+    # TSETMC prices are Rial; capital configuration is Toman.
+    risk_budget_rial = CAPITAL_RIAL * RISK_PERCENT / 100
+    max_position_rial = CAPITAL_RIAL * MAX_POSITION_PERCENT / 100
+
+    risk_per_share_rial = entry - stop
+
+    shares_by_risk = int(
+        risk_budget_rial / risk_per_share_rial
+    )
+    shares_by_capital = int(
+        max_position_rial / entry
+    )
+
+    shares = max(
+        0,
+        min(shares_by_risk, shares_by_capital),
+    )
+
+    position_rial = shares * entry
+    risk_rial = shares * risk_per_share_rial
 
     return {
-        "symbol": symbol,
-        "direction": direction,
-        "price": price,
-        "stop": stop,
-        "target1": target1,
-        "target2": target2,
+        "symbol": symbol["symbol"],
+        "name": symbol["name"],
+        "entry": entry,
         "score": score,
-        "rsi15": a15["rsi"],
-        "rsi1h": a1h["rsi"],
-        "volume_ratio": a15["volume_ratio"],
-        "support": a15["support"],
-        "resistance": a15["resistance"],
-        "btc_trend": btc_trend,
-        "assumed_notional": assumed_notional,
-        "assumed_quantity": assumed_quantity,
-        "risk_percent": risk_percent
+        "rsi": rsi_value,
+        "ema20": ema20,
+        "ema50": ema50,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "shares": shares,
+        "position_rial": position_rial,
+        "position_toman": position_rial / 10,
+        "risk_rial": risk_rial,
+        "risk_toman": risk_rial / 10,
+        "reasons": reasons,
     }
 
 
-def get_btc_trend():
-    # BTC candles are used only as a market-direction filter.
-    candidates = ("BTC_USDT", "BTC_USDT_PERPETUAL")
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
 
-    for symbol in candidates:
-        try:
-            candles = load_candles(symbol, "1h")
-            result = analyze_timeframe(candles)
-            return result["trend"]
-        except Exception as exc:
-            logging.info("BTC reference unavailable for %s: %s", symbol, exc)
+def format_signal(s):
+    reasons = "\n".join(
+        f"• {item}" for item in s["reasons"]
+    )
 
-    return "UNKNOWN"
+    return (
+        "🇮🇷 IRAN STOCK WHALE\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🧪 سیگنال خرید آزمایشی\n"
+        "🚫 سفارش واقعی: غیرفعال\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🏷 نماد: {s['symbol']}\n"
+        f"📌 نام: {s['name']}\n"
+        f"⭐ امتیاز: {s['score']}/100\n"
+        f"📈 RSI: {fa_num(s['rsi'], 1)}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💰 ورود فرضی: {price_text(s['entry'])}\n"
+        f"🛑 حد ضرر: {price_text(s['stop'])}\n"
+        f"🎯 هدف ۱: {price_text(s['tp1'])}\n"
+        f"🎯 هدف ۲: {price_text(s['tp2'])}\n"
+        f"🎯 هدف ۳: {price_text(s['tp3'])}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📦 تعداد فرضی: {fa_num(s['shares'])} سهم\n"
+        f"💵 ارزش موقعیت: {fa_num(s['position_toman'])} تومان\n"
+        f"⚠️ ریسک فرضی: {fa_num(s['risk_toman'])} تومان\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔎 دلایل:\n{reasons}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 {iran_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "⚠️ قیمت‌ها و اهداف تضمین اجرا یا سود نیستند."
+    )
 
 
-def format_signal(sig):
-    direction_label = "🟢 LONG" if sig["direction"] == "LONG" else "🔴 SHORT"
+# ============================================================
+# SCAN
+# ============================================================
 
-    return "\n".join([
-        f"📌 {sig['symbol']} — {direction_label}",
-        f"⭐ امتیاز محافظه‌کارانه: {sig['score']}/100",
-        f"💵 ورود مرجع: {sig['price']:.8g}",
-        f"🛑 حد ضرر: {sig['stop']:.8g}",
-        f"🎯 هدف ۱: {sig['target1']:.8g}",
-        f"🎯 هدف ۲: {sig['target2']:.8g}",
-        f"📉 فاصله حد ضرر: {sig['risk_percent']:.2f}%",
-        f"📊 RSI 15m / 1h: {sig['rsi15']:.1f} / {sig['rsi1h']:.1f}",
-        f"📦 نسبت حجم: {sig['volume_ratio']:.2f}x",
-        f"🧱 حمایت: {sig['support']:.8g}",
-        f"🧱 مقاومت: {sig['resistance']:.8g}",
-        f"₿ روند BTC: {sig['btc_trend']}",
-        f"🧪 ارزش اسمی فرضی: {sig['assumed_notional']:.2f} USDT",
-        "━━━━━━━━━━━━━━━━━━"
-    ])
+def run_scan():
+    state = load_state()
+    today = iran_now().strftime("%Y-%m-%d")
 
-
-def main():
-    logging.info("Starting ETH WHALE paper futures scanner")
-
-    markets = load_markets()
-    futures_markets = [
-        m for m in markets
-        if isinstance(m, dict)
-        and explicitly_futures(m)
-        and market_symbol(m)
-        and (
-            market_symbol(m).endswith("_USDT")
-            or "USDT" in market_symbol(m)
+    try:
+        symbols = get_market_watch()
+    except Exception as exc:
+        log.exception("Cannot retrieve market watch")
+        telegram_send(
+            "❌ اسکن بازار انجام نشد.\n"
+            f"علت: {str(exc)[:250]}\n"
+            "🚫 هیچ سفارش واقعی ارسال نشده است."
         )
-    ]
-
-    if not futures_markets:
-        message = (
-            "🐋 ETH WHALE\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "⚠️ سیگنال فیوچرز صادر نشد.\n"
-            "فهرست عمومی بازارها، قراردادهای فیوچرز را به‌طور قابل‌تأیید مشخص نکرد.\n"
-            "برای جلوگیری از اشتباه، بازار اسپات به‌عنوان فیوچرز استفاده نشد.\n"
-            "لطفاً مستندات رسمی فهرست قراردادهای فیوچرز را بررسی کنیم.\n"
-            "🧪 سفارش واقعی: خاموش"
-        )
-        print(message)
-        telegram_send(message)
         return
 
-    btc_trend = get_btc_trend()
-
-    if btc_trend == "UNKNOWN":
-        message = (
-            "🐋 ETH WHALE\n"
-            "⚠️ فیلتر روند BTC در دسترس نیست؛ اسکن محافظه‌کارانه متوقف شد.\n"
-            "🧪 سفارش واقعی: خاموش"
+    if not symbols:
+        telegram_send(
+            "⚠️ فهرست نمادها خالی است؛ "
+            "سیگنالی تولید نشد."
         )
-        print(message)
-        telegram_send(message)
         return
+
+    telegram_send(
+        "🐋 IRAN STOCK WHALE\n"
+        "🟢 اسکن شروع شد\n"
+        f"🔍 نمادهای دریافتی: {len(symbols)}\n"
+        f"💰 سرمایه فرضی: {fa_num(CAPITAL_TOMAN)} تومان\n"
+        "🧪 حالت آزمایشی | سفارش واقعی OFF"
+    )
 
     signals = []
-    errors = []
 
-    for market in futures_markets:
-        symbol = market_symbol(market)
+    for index, symbol in enumerate(symbols, start=1):
         try:
-            signal = analyze_symbol(symbol, btc_trend)
+            history = get_daily_history(symbol["code"])
+            signal = analyze_symbol(symbol, history)
+
             if signal:
-                signals.append(signal)
+                key = f"{today}:{signal['symbol']}"
+
+                if key not in state["sent"]:
+                    signals.append(signal)
+
         except Exception as exc:
-            errors.append(f"{symbol}: {str(exc)[:120]}")
-            logging.warning("Skipping %s: %s", symbol, exc)
+            log.warning(
+                "Skipping %s due to error: %s",
+                symbol["symbol"],
+                exc,
+            )
 
-    signals.sort(key=lambda x: x["score"], reverse=True)
-    signals = signals[:MAX_SIGNALS]
+        if index % 50 == 0:
+            log.info("Progress: %s/%s", index, len(symbols))
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        "🐋 ETH WHALE",
-        "━━━━━━━━━━━━━━━━━━",
-        "📊 BITPIN FUTURES SIGNAL SCANNER",
-        "🧪 PAPER ONLY — NO REAL ORDERS",
-        f"🕒 {now}",
-        f"💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT",
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x",
-        f"💵 مارجین فرضی هر موقعیت: {MARGIN_USDT:.2f} USDT",
-        f"📦 ارزش اسمی فرضی: {MARGIN_USDT * LEVERAGE:.2f} USDT",
-        f"₿ روند مرجع BTC: {btc_trend}",
-        f"🔎 قراردادهای شناسایی‌شده از متادیتا: {len(futures_markets)}",
-        "━━━━━━━━━━━━━━━━━━"
-    ]
+        time.sleep(REQUEST_DELAY)
 
-    if signals:
-        for sig in signals:
-            lines.append(format_signal(sig))
+    signals.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+    signals = signals[:MAX_SIGNALS_PER_SCAN]
+
+    sent_count = 0
+
+    for signal in signals:
+        key = f"{today}:{signal['symbol']}"
+
+        # Mark as sent only after Telegram confirms delivery.
+        if telegram_send(format_signal(signal)):
+            sent_count += 1
+            state["sent"][key] = iran_now().isoformat()
+
+            state["paper_trades"].append({
+                "date": today,
+                "symbol": signal["symbol"],
+                "entry": signal["entry"],
+                "stop": signal["stop"],
+                "tp1": signal["tp1"],
+                "tp2": signal["tp2"],
+                "tp3": signal["tp3"],
+                "shares": signal["shares"],
+                "status": "PAPER_OPEN",
+            })
+
+    state["last_scan"] = iran_now().isoformat()
+    state["last_scan_symbols"] = len(symbols)
+    state["last_scan_signals"] = len(signals)
+
+    try:
+        save_state(state)
+    except OSError:
+        log.exception("Could not save state")
+
+    telegram_send(
+        "📊 گزارش اسکن بورس\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 نمادهای بررسی‌شده: {len(symbols)}\n"
+        f"📈 سیگنال‌های واجد شرایط: {len(signals)}\n"
+        f"📨 پیام‌های ارسال‌شده: {sent_count}\n"
+        "🧪 PAPER ONLY\n"
+        "🚫 سفارش واقعی: OFF"
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def main():
+    log.info("Starting %s", BOT_NAME)
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error(
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID first."
+        )
+        return
+
+    if telegram_send(
+        "🐋 IRAN STOCK WHALE\n"
+        "ربات راه‌اندازی شد.\n"
+        "🧪 فقط سیگنال آزمایشی\n"
+        "🚫 سفارش واقعی غیرفعال"
+    ):
+        run_scan()
     else:
-        lines.append("⏸ با فیلترهای محافظه‌کارانه سیگنال تأییدشده‌ای پیدا نشد.")
-
-    lines.extend([
-        "⚠️ Funding Rate و Open Interest استفاده نشده‌اند؛ مسیر رسمی آن‌ها هنوز تأیید نشده است.",
-        "⚠️ این کد اندازه قرارداد و حداقل مقدار سفارش فیوچرز را از صرافی تأیید نمی‌کند.",
-        "🚫 هیچ سفارش واقعی ثبت نمی‌شود."
-    ])
-
-    report = "\n".join(lines)
-    print(report)
-    telegram_send(report)
+        log.error("Startup Telegram test failed; scan aborted.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        logging.exception("Fatal scanner error")
-        message = (
-            "🐋 ETH WHALE\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "❌ اسکن کامل نشد.\n"
-            f"علت: {type(exc).__name__}: {str(exc)[:500]}\n"
-            "🧪 سفارش واقعی ثبت نشده است."
-        )
-        print(message)
-        try:
-            telegram_send(message)
-        except Exception:
-            logging.exception("Telegram error notification failed")
-        raise
+    main()
