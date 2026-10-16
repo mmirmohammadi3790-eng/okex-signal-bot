@@ -1,0 +1,64 @@
+{
+  "last_alert": {
+    "ETH_USDT:SHORT": 1792166178,
+    "SOL_USDT:SHORT": 1792166178,
+    "XRP_USDT:SHORT": 1792166178
+  },
+  "active": [
+    {
+      "symbol": "ETH_USDT",
+      "direction": "SHORT",
+      "entry": 2435.34,
+      "current_price": 2435.34,
+      "stop": 2454.82272,
+      "targets": [
+        2415.85728,
+        2396.37456,
+        2376.8918400000002
+      ],
+      "move_pct": -0.6291925769965264,
+      "ratio": 0.6153846153846154,
+      "trade_count": 30,
+      "created_at": 1792166178,
+      "status": "OPEN",
+      "highest_tp": 0
+    },
+    {
+      "symbol": "SOL_USDT",
+      "direction": "SHORT",
+      "entry": 104.2,
+      "current_price": 104.2,
+      "stop": 105.0336,
+      "targets": [
+        103.3664,
+        102.5328,
+        101.6992
+      ],
+      "move_pct": -0.4128756021102551,
+      "ratio": 0.7,
+      "trade_count": 30,
+      "created_at": 1792166178,
+      "status": "OPEN",
+      "highest_tp": 0
+    },
+    {
+      "symbol": "XRP_USDT",
+      "direction": "SHORT",
+      "entry": 1.30935,
+      "current_price": 1.30935,
+      "stop": 1.3198248000000001,
+      "targets": [
+        1.2988752,
+        1.2884004,
+        1.2779255999999999
+      ],
+      "move_pct": -0.45690913514171555,
+      "ratio": 0.6818181818181818,
+      "trade_count": 30,
+      "created_at": 1792166178,
+      "status": "OPEN",
+      "highest_tp": 0
+    }
+  ],
+  "history": []
+}
