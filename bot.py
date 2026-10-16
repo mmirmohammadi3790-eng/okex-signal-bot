@@ -1,69 +1,75 @@
 
 import os
 import time
-import math
 import logging
 import requests
+import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 
 # ============================================================
-# 🐋 ETH WHALE — BALANCED TREND WATCH + TP1/TP2/TP3
-# PAPER ANALYSIS ONLY — NO REAL ORDERS
+# ETH WHALE | BITPIN SMART SIGNAL BOT
+# PAPER TRADING ONLY - NO REAL ORDERS
+# Capital: 48 USDT | Leverage: 3x
 # ============================================================
 
 BOT_NAME = "🐋 ETH WHALE"
-BINANCE_BASE = "https://data-api.binance.vision"
-BYBIT_BASE = "https://api.bybit.com"
+CAPITAL_USDT = 48.0
+LEVERAGE = 3
+MARGIN_PER_TRADE = 16.0
+MAX_NOTIONAL = MARGIN_PER_TRADE * LEVERAGE
+
+RISK_PERCENT = 1.0
+MIN_SCORE = 70
+STRONG_SCORE = 80
+MIN_RR = 1.5
+MIN_VOLUME_RATIO = 1.15
+MAX_MARKETS = 30
+MAX_SIGNALS = 3
+TIMEOUT = 15
+PAPER_MODE = True
+REAL_ORDERS_ENABLED = False
 
 TELEGRAM_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
     or os.getenv("TELEGRAM_TOKEN")
     or ""
 )
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or ""
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MAX_MARKETS = 25
-CANDLE_LIMIT = 100
-REQUEST_TIMEOUT = 15
-PAUSE_BETWEEN_MARKETS = 0.15
-
-EXCLUDED_BASES = {
-    "USDC", "USDP", "FDUSD", "TUSD", "BUSD",
-    "DAI", "USDE", "USDD", "UST", "USTC",
-    "EUR", "EURC", "PAXG"
-}
-
-LEVERAGED_ENDINGS = (
-    "UP", "DOWN", "BULL", "BEAR", "2L", "2S",
-    "3L", "3S", "5L", "5S"
-)
+BITPIN_BASES = [
+    "https://api.bitpin.ir",
+    "https://api.bitpin.org",
+]
+BINANCE_BASE = "https://api.binance.com"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-Balanced-Paper-Analyzer/2.0"
+    "User-Agent": "ETH-WHALE-PaperBot/1.0",
+    "Accept": "application/json",
 })
 
 
-# -------------------- HTTP --------------------
+# ---------------- TELEGRAM ----------------
 
-def get_json(url, params=None):
-    response = SESSION.get(
-        url, params=params, timeout=REQUEST_TIMEOUT
+def escape_html(value):
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
-    response.raise_for_status()
-    return response.json()
 
 
-def send_telegram(message):
+def telegram_send(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID secrets."
-        )
+        logging.warning("Telegram credentials missing")
+        return False
 
     url = (
         "https://api.telegram.org/bot"
@@ -71,526 +77,702 @@ def send_telegram(message):
         + "/sendMessage"
     )
 
-    response = SESSION.post(
+    try:
+        response = SESSION.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json().get("ok", False)
+
+    except Exception as exc:
+        logging.error("Telegram error: %s", exc)
+        return False
+
+
+# ---------------- HTTP ----------------
+
+def get_json(url, params=None):
+    response = SESSION.get(
         url,
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        },
-        timeout=REQUEST_TIMEOUT
+        params=params,
+        timeout=TIMEOUT,
     )
     response.raise_for_status()
-
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError("Telegram API returned ok=false.")
+    return response.json()
 
 
-# -------------------- INDICATORS --------------------
+def rows_from(data):
+    if isinstance(data, list):
+        return data
 
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    alpha = 2.0 / (period + 1.0)
-    value = sum(values[:period]) / period
-
-    for item in values[period:]:
-        value = alpha * item + (1.0 - alpha) * value
-
-    return value
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-
-    gains = [max(x, 0.0) for x in changes]
-    losses = [max(-x, 0.0) for x in changes]
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(changes)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-
-    rs = avg_gain / avg_loss
-    return 100.0 - 100.0 / (1.0 + rs)
-
-
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-
-    trs = []
-
-    for i in range(1, len(candles)):
-        current = candles[i]
-        previous_close = candles[i - 1]["close"]
-
-        trs.append(max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close)
-        ))
-
-    value = sum(trs[:period]) / period
-
-    for tr in trs[period:]:
-        value = (value * (period - 1) + tr) / period
-
-    return value
-
-
-# -------------------- MARKET DATA --------------------
-
-def get_binance_markets():
-    tickers = get_json(
-        BINANCE_BASE + "/api/v3/ticker/24hr"
-    )
-    info = get_json(
-        BINANCE_BASE + "/api/v3/exchangeInfo"
-    )
-
-    allowed = set()
-
-    for item in info.get("symbols", []):
-        if (
-            item.get("status") != "TRADING"
-            or item.get("quoteAsset") != "USDT"
-            or not item.get("isSpotTradingAllowed", True)
+    if isinstance(data, dict):
+        for key in (
+            "results", "data", "markets", "tickers",
+            "items", "symbols", "payload"
         ):
-            continue
+            value = data.get(key)
 
-        symbol = item.get("symbol", "")
-        base = item.get("baseAsset", "")
+            if isinstance(value, list):
+                return value
 
-        if base in EXCLUDED_BASES:
-            continue
+            if isinstance(value, dict):
+                result = rows_from(value)
+                if result:
+                    return result
 
-        if base.endswith(LEVERAGED_ENDINGS):
-            continue
-
-        allowed.add(symbol)
-
-    markets = []
-
-    for item in tickers:
-        symbol = item.get("symbol", "")
-
-        if symbol not in allowed:
-            continue
-
-        try:
-            price = float(item.get("lastPrice", 0))
-            volume = float(item.get("quoteVolume", 0))
-
-            if price > 0 and volume > 0:
-                markets.append({
-                    "symbol": symbol,
-                    "price": price,
-                    "volume": volume
-                })
-        except (TypeError, ValueError):
-            continue
-
-    markets.sort(key=lambda x: x["volume"], reverse=True)
-    return markets[:MAX_MARKETS]
+    return []
 
 
-def get_binance_candles(symbol, interval):
-    raw = get_json(
-        BINANCE_BASE + "/api/v3/klines",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": CANDLE_LIMIT
-        }
+def first_value(item, keys):
+    if not isinstance(item, dict):
+        return None
+
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
+def normalize_symbol(value):
+    return (
+        str(value)
+        .upper()
+        .replace("-", "_")
+        .replace("/", "_")
+        .replace(" ", "")
     )
 
-    candles = []
 
-    for item in raw:
-        candles.append({
-            "open": float(item[1]),
-            "high": float(item[2]),
-            "low": float(item[3]),
-            "close": float(item[4]),
-            "volume": float(item[5])
-        })
+# ---------------- BITPIN MARKET DATA ----------------
 
-    # Remove the latest candle because it may still be open.
-    return candles[:-1]
+def bitpin_get(paths):
+    errors = []
 
+    for base in BITPIN_BASES:
+        for path in paths:
+            try:
+                return get_json(base + path)
+            except Exception as exc:
+                errors.append(
+                    f"{path}: {type(exc).__name__}"
+                )
 
-def get_bybit_markets():
-    data = get_json(
-        BYBIT_BASE + "/v5/market/tickers",
-        {"category": "linear"}
+    raise RuntimeError(
+        "Bitpin API unavailable: " + "; ".join(errors[-4:])
     )
-
-    markets = []
-
-    for item in data.get("result", {}).get("list", []):
-        symbol = item.get("symbol", "")
-
-        if not symbol.endswith("USDT"):
-            continue
-
-        base = symbol[:-4]
-
-        if base in EXCLUDED_BASES:
-            continue
-
-        if base.endswith(LEVERAGED_ENDINGS):
-            continue
-
-        try:
-            price = float(item.get("lastPrice", 0))
-            volume = float(item.get("turnover24h", 0))
-
-            if price > 0 and volume > 0:
-                markets.append({
-                    "symbol": symbol,
-                    "price": price,
-                    "volume": volume
-                })
-        except (TypeError, ValueError):
-            continue
-
-    markets.sort(key=lambda x: x["volume"], reverse=True)
-    return markets[:MAX_MARKETS]
-
-
-def get_bybit_candles(symbol, interval):
-    data = get_json(
-        BYBIT_BASE + "/v5/market/kline",
-        {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": CANDLE_LIMIT
-        }
-    )
-
-    raw = data.get("result", {}).get("list", [])
-    raw = list(reversed(raw))
-    candles = []
-
-    for item in raw:
-        candles.append({
-            "open": float(item[1]),
-            "high": float(item[2]),
-            "low": float(item[3]),
-            "close": float(item[4]),
-            "volume": float(item[5])
-        })
-
-    return candles[:-1]
 
 
 def load_markets():
-    try:
-        markets = get_binance_markets()
+    market_data = bitpin_get([
+        "/api/v1/mkt/markets/",
+        "/v1/mkt/markets/",
+        "/api/v1/spot/public/pairs",
+    ])
 
-        if markets:
-            return "Binance Spot", markets, get_binance_candles
+    ticker_data = bitpin_get([
+        "/api/v1/mkt/tickers/",
+        "/v1/mkt/tickers/",
+        "/api/v1/spot/public/tickers",
+    ])
 
-    except Exception as exc:
-        logging.warning("Binance unavailable: %s", exc)
+    market_rows = rows_from(market_data)
+    ticker_rows = rows_from(ticker_data)
 
-    markets = get_bybit_markets()
+    if not market_rows:
+        raise RuntimeError(
+            "Bitpin markets response contains no market list"
+        )
 
-    if markets:
-        return "Bybit Linear", markets, get_bybit_candles
+    if not ticker_rows:
+        raise RuntimeError(
+            "Bitpin tickers response contains no ticker list"
+        )
 
-    raise RuntimeError("Unable to load markets from Binance or Bybit.")
+    ticker_map = {}
+
+    for item in ticker_rows:
+        symbol = first_value(
+            item,
+            ["symbol", "market", "pair", "code", "name"],
+        )
+        price = first_value(
+            item,
+            [
+                "last", "last_price", "lastPrice",
+                "price", "close", "last_trade_price"
+            ],
+        )
+
+        if symbol is None or price is None:
+            continue
+
+        try:
+            price = float(price)
+            if price > 0:
+                ticker_map[normalize_symbol(symbol)] = price
+        except (TypeError, ValueError):
+            continue
+
+    excluded = {
+        "USDT", "USDC", "BUSD", "DAI", "FDUSD",
+        "TUSD", "USDE", "WBTC", "STETH",
+    }
+
+    markets = []
+
+    for item in market_rows:
+        symbol_raw = first_value(
+            item,
+            ["symbol", "market", "pair", "code", "name"],
+        )
+
+        if symbol_raw is None:
+            continue
+
+        symbol = normalize_symbol(symbol_raw)
+
+        if not symbol.endswith("_USDT"):
+            continue
+
+        asset = symbol[:-5]
+
+        if asset in excluded:
+            continue
+
+        if any(
+            tag in asset
+            for tag in ("3L", "3S", "5L", "5S", "2L", "2S")
+        ):
+            continue
+
+        if symbol not in ticker_map:
+            continue
+
+        markets.append({
+            "symbol": symbol,
+            "asset": asset,
+            "price": ticker_map[symbol],
+        })
+
+    if not markets:
+        raise RuntimeError(
+            "No USDT markets matched ticker symbols"
+        )
+
+    return markets
 
 
-# -------------------- SUPPORT / RESISTANCE --------------------
+# ---------------- CANDLES ----------------
 
-def find_levels(candles, price):
-    recent = candles[-40:]
+def load_candles(asset, interval, limit=150):
+    symbol = asset.upper() + "USDT"
 
-    below = [c["low"] for c in recent if c["low"] < price]
-    above = [c["high"] for c in recent if c["high"] > price]
+    data = get_json(
+        BINANCE_BASE + "/api/v3/klines",
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        },
+    )
 
-    support = max(below) if below else min(c["low"] for c in recent)
-    resistance = min(above) if above else max(c["high"] for c in recent)
+    if not isinstance(data, list) or len(data) < 60:
+        raise RuntimeError(
+            f"Insufficient {interval} candles for {symbol}"
+        )
 
-    if support >= price:
-        support = min(c["low"] for c in recent)
+    columns = [
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume",
+        "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
+    ]
 
-    if resistance <= price:
-        resistance = max(c["high"] for c in recent)
+    df = pd.DataFrame(data, columns=columns)
 
-    return support, resistance
+    for col in [
+        "open", "high", "low", "close",
+        "volume", "quote_volume",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Exclude the last potentially unfinished candle.
+    df = df.iloc[:-1].copy()
+    df.dropna(inplace=True)
+
+    return df
 
 
-def price_text(value):
-    if value >= 1000:
-        return f"{value:,.2f}"
-    if value >= 1:
-        return f"{value:.5f}".rstrip("0").rstrip(".")
-    if value >= 0.01:
-        return f"{value:.6f}".rstrip("0").rstrip(".")
-    return f"{value:.8f}".rstrip("0").rstrip(".")
+# ---------------- INDICATORS ----------------
+
+def indicators(frame):
+    df = frame.copy()
+
+    df["ema20"] = df["close"].ewm(
+        span=20, adjust=False
+    ).mean()
+
+    df["ema50"] = df["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    delta = df["close"].diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+
+    avg_gain = gains.ewm(
+        alpha=1 / 14, adjust=False, min_periods=14
+    ).mean()
+
+    avg_loss = losses.ewm(
+        alpha=1 / 14, adjust=False, min_periods=14
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    previous = df["close"].shift(1)
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - previous).abs(),
+        (df["low"] - previous).abs(),
+    ], axis=1).max(axis=1)
+
+    df["atr"] = tr.ewm(
+        alpha=1 / 14, adjust=False
+    ).mean()
+
+    df["volume_avg"] = df["volume"].rolling(20).mean()
+
+    df["volume_ratio"] = (
+        df["volume"]
+        / df["volume_avg"].replace(0, np.nan)
+    )
+
+    return df
 
 
-# -------------------- BALANCED ANALYSIS --------------------
+# ---------------- SIGNAL ANALYSIS ----------------
 
-def analyze_market(market, candle_fetcher):
-    symbol = market["symbol"]
+def analyze_market(market):
+    asset = market["asset"]
 
-    candles15 = candle_fetcher(symbol, "15m")
-    candles1h = candle_fetcher(symbol, "1h")
+    df15 = indicators(load_candles(asset, "15m"))
+    df1h = indicators(load_candles(asset, "1h"))
 
-    if len(candles15) < 55 or len(candles1h) < 55:
-        return None, "کمبود کندل"
+    a = df15.iloc[-1]
+    b = df1h.iloc[-1]
 
-    closes15 = [c["close"] for c in candles15]
-    closes1h = [c["close"] for c in candles1h]
-    price = closes15[-1]
+    price = float(a["close"])
+    atr = float(a["atr"])
+    rsi15 = float(a["rsi"])
+    rsi1h = float(b["rsi"])
+    volume_ratio = float(a["volume_ratio"])
 
-    e20_15 = ema(closes15, 20)
-    e50_15 = ema(closes15, 50)
-    e20_1h = ema(closes1h, 20)
-    e50_1h = ema(closes1h, 50)
-    r15 = rsi(closes15)
-    r1h = rsi(closes1h)
-    a15 = atr(candles15)
+    if not all(np.isfinite(x) for x in [
+        price, atr, rsi15, rsi1h
+    ]):
+        raise RuntimeError("Invalid indicator values")
 
-    values = [e20_15, e50_15, e20_1h, e50_1h, r15, r1h, a15]
-    if any(x is None for x in values) or price <= 0:
-        return None, "اندیکاتور ناقص"
+    if price <= 0 or atr <= 0:
+        raise RuntimeError("Invalid price or ATR")
 
-    support, resistance = find_levels(candles15, price)
+    if not np.isfinite(volume_ratio):
+        volume_ratio = 0.0
 
-    if support >= price or resistance <= price:
-        return None, "سطوح نامعتبر"
+    e20_15 = float(a["ema20"])
+    e50_15 = float(a["ema50"])
+    e20_1h = float(b["ema20"])
+    e50_1h = float(b["ema50"])
 
-    support_pct = (price - support) / price * 100
-    resistance_pct = (resistance - price) / price * 100
+    recent = df15.tail(40)
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
 
-    gap15 = abs(e20_15 - e50_15) / price * 100
-    gap1h = abs(e20_1h - e50_1h) / price * 100
+    long_score = 0
+    short_score = 0
+    long_reasons = []
+    short_reasons = []
 
-    # Flexible RSI filters: still require both timeframes to agree.
-    bullish = (
+    # 1. EMA trend: 25 points.
+    if e20_15 > e50_15:
+        long_score += 15
+        long_reasons.append("EMA 15m صعودی")
+    elif e20_15 < e50_15:
+        short_score += 15
+        short_reasons.append("EMA 15m نزولی")
+
+    if e20_1h > e50_1h:
+        long_score += 10
+        long_reasons.append("EMA یک‌ساعته صعودی")
+    elif e20_1h < e50_1h:
+        short_score += 10
+        short_reasons.append("EMA یک‌ساعته نزولی")
+
+    # 2. RSI: 15 points.
+    if 50 < rsi15 < 70 and rsi1h > 50:
+        long_score += 15
+        long_reasons.append("RSI تأیید خریدار")
+    elif 30 < rsi15 < 50 and rsi1h < 50:
+        short_score += 15
+        short_reasons.append("RSI تأیید فروشنده")
+
+    # 3. Volume: 15 points.
+    if volume_ratio >= MIN_VOLUME_RATIO:
+        if price > float(a["open"]):
+            long_score += 15
+            long_reasons.append("حجم صعودی")
+        elif price < float(a["open"]):
+            short_score += 15
+            short_reasons.append("حجم نزولی")
+
+    # 4. Price structure and room to barrier: 20 points.
+    room_up = (resistance - price) / price
+    room_down = (price - support) / price
+
+    if (
+        price > e20_15
+        and price < resistance
+        and room_up >= 0.005
+    ):
+        long_score += 20
+        long_reasons.append("فضای کافی تا مقاومت")
+
+    if (
+        price < e20_15
+        and price > support
+        and room_down >= 0.005
+    ):
+        short_score += 20
+        short_reasons.append("فضای کافی تا حمایت")
+
+    # 5. Higher timeframe confirmation: 15 points.
+    if e20_1h > e50_1h and rsi1h > 50:
+        long_score += 15
+        long_reasons.append("تأیید روند یک‌ساعته")
+
+    if e20_1h < e50_1h and rsi1h < 50:
+        short_score += 15
+        short_reasons.append("تأیید روند یک‌ساعته")
+
+    # 6. Risk/reward: 10 points.
+    stop_distance = max(1.5 * atr, price * 0.003)
+
+    long_sl = price - stop_distance
+    long_tp1 = price + stop_distance * MIN_RR
+    long_tp2 = price + stop_distance * 2
+    long_tp3 = price + stop_distance * 3
+
+    short_sl = price + stop_distance
+    short_tp1 = price - stop_distance * MIN_RR
+    short_tp2 = price - stop_distance * 2
+    short_tp3 = price - stop_distance * 3
+
+    if long_tp1 < resistance and long_sl > 0:
+        long_score += 10
+        long_reasons.append("نسبت سود به ضرر مناسب")
+
+    if short_tp1 > support and short_tp3 > 0:
+        short_score += 10
+        short_reasons.append("نسبت سود به ضرر مناسب")
+
+    long_confirmed = (
         e20_15 > e50_15
         and e20_1h > e50_1h
-        and price > e20_15
-        and 43 <= r15 <= 70
-        and 38 <= r1h <= 72
+        and rsi1h > 50
     )
 
-    bearish = (
+    short_confirmed = (
         e20_15 < e50_15
         and e20_1h < e50_1h
-        and price < e20_15
-        and 30 <= r15 <= 57
-        and 28 <= r1h <= 62
+        and rsi1h < 50
     )
 
-    if not bullish and not bearish:
-        return None, "عدم تأیید روند دو تایم‌فریمی"
+    if (
+        long_score >= MIN_SCORE
+        and long_confirmed
+        and long_score > short_score
+        and long_tp1 < resistance
+    ):
+        side = "LONG"
+        score = long_score
+        sl = long_sl
+        tp1, tp2, tp3 = long_tp1, long_tp2, long_tp3
+        reasons = long_reasons
 
-    direction = "LONG" if bullish else "SHORT"
-    room_pct = resistance_pct if bullish else support_pct
+    elif (
+        short_score >= MIN_SCORE
+        and short_confirmed
+        and short_score > long_score
+        and short_tp1 > support
+    ):
+        side = "SHORT"
+        score = short_score
+        sl = short_sl
+        tp1, tp2, tp3 = short_tp1, short_tp2, short_tp3
+        reasons = short_reasons
 
-    # Softer filters than the previous version.
-    if gap15 < 0.01 or gap1h < 0.01:
-        return None, "قدرت EMA کم"
-
-    if room_pct < 0.30:
-        return None, "فاصله کم تا مانع قیمتی"
-
-    # TP1/TP2 are staged before the nearest obstacle.
-    # TP3 is the nearest estimated support/resistance.
-    if direction == "LONG":
-        tp1 = price + (resistance - price) * 0.30
-        tp2 = price + (resistance - price) * 0.65
-        tp3 = resistance
-        rsi_quality = 1.0 - abs(r15 - 55) / 30
     else:
-        tp1 = price - (price - support) * 0.30
-        tp2 = price - (price - support) * 0.65
-        tp3 = support
-        rsi_quality = 1.0 - abs(r15 - 45) / 30
+        return {
+            "symbol": market["symbol"],
+            "side": "WAIT",
+            "score": max(long_score, short_score),
+            "reason": (
+                "روند یا امتیاز کافی نیست؛ "
+                "یا فاصله تا حمایت/مقاومت مناسب نیست"
+            ),
+        }
 
-    rsi_quality = max(0.0, min(1.0, rsi_quality))
+    rr = abs(tp1 - price) / abs(price - sl)
 
-    # Normalize 24h volume so one huge market does not dominate.
-    volume_score = min(
-        1.0,
-        max(0.0, math.log10(max(market["volume"], 1)) / 10)
-    )
+    if rr < MIN_RR:
+        return {
+            "symbol": market["symbol"],
+            "side": "WAIT",
+            "score": score,
+            "reason": "نسبت سود به ضرر ناکافی",
+        }
 
-    trend_score = min(20.0, gap15 * 8) + min(20.0, gap1h * 8)
-    room_score = min(20.0, room_pct * 4)
-    score = trend_score + room_score + rsi_quality * 20 + volume_score * 20
-    score = max(0.0, min(100.0, score))
+    # Risk-based sizing with a maximum notional cap.
+    risk_budget = CAPITAL_USDT * RISK_PERCENT / 100
+    qty_by_risk = risk_budget / abs(price - sl)
+    qty_by_notional = MAX_NOTIONAL / price
+
+    quantity = min(qty_by_risk, qty_by_notional)
+
+    notional = quantity * price
+    margin = notional / LEVERAGE
+    estimated_risk = quantity * abs(price - sl)
 
     return {
-        "symbol": symbol,
-        "direction": direction,
-        "price": price,
-        "volume": market["volume"],
-        "rsi15": r15,
-        "rsi1h": r1h,
-        "ema20_15": e20_15,
-        "ema50_15": e50_15,
-        "ema20_1h": e20_1h,
-        "ema50_1h": e50_1h,
-        "support": support,
-        "resistance": resistance,
-        "support_pct": support_pct,
-        "resistance_pct": resistance_pct,
+        "symbol": market["symbol"],
+        "side": side,
+        "score": score,
+        "entry": price,
+        "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "room_pct": room_pct,
-        "score": score
-    }, None
+        "rsi15": rsi15,
+        "rsi1h": rsi1h,
+        "volume_ratio": volume_ratio,
+        "support": support,
+        "resistance": resistance,
+        "rr": rr,
+        "notional": notional,
+        "margin": margin,
+        "risk": estimated_risk,
+        "reasons": reasons,
+    }
 
 
-# -------------------- REPORT --------------------
+# ---------------- MESSAGE FORMATTING ----------------
 
-def build_report(best, source, checked, failures, reasons):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def fmt(value):
+    value = float(value)
 
-    if best is None:
-        reason_text = "\n".join(
-            f"• {name}: {count}"
-            for name, count in sorted(
-                reasons.items(),
-                key=lambda item: item[1],
-                reverse=True
-            )[:3]
-        ) or "• گزینه واجد شرایط پیدا نشد"
+    if value >= 1000:
+        return f"{value:,.2f}"
 
-        return (
-            f"{BOT_NAME}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📊 <b>گزارش روند بازار</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "⚪ <b>WAIT — گزینه مناسب پیدا نشد</b>\n\n"
-            f"🔎 بازارهای بررسی‌شده: {checked}\n"
-            f"⚠️ خطاهای تحلیل: {failures}\n"
-            f"📌 دلایل اصلی رد بازارها:\n{reason_text}\n\n"
-            f"منبع: {source}\n"
-            f"زمان: {now}\n\n"
-            "🧪 تحلیل آزمایشی؛ هیچ سفارش واقعی ثبت نشده است."
-        )
+    if value >= 1:
+        return f"{value:.5f}".rstrip("0").rstrip(".")
 
-    direction_text = (
-        "صعودی / LONG"
-        if best["direction"] == "LONG"
-        else "نزولی / SHORT"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def signal_message(s):
+    emoji = "🟢" if s["side"] == "LONG" else "🔴"
+    strength = (
+        "🔥 قوی"
+        if s["score"] >= STRONG_SCORE
+        else "✅ قابل بررسی"
+    )
+
+    reasons = "\n".join(
+        "• " + escape_html(x)
+        for x in s["reasons"]
     )
 
     return (
-        f"{BOT_NAME}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🎯 <b>بهترین گزینه این اسکن</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 نماد: <b>{best['symbol']}</b>\n"
-        f"📈 جهت روند: <b>{direction_text}</b>\n"
-        f"💵 قیمت مبنا: <code>{price_text(best['price'])}</code>\n"
-        f"⭐ امتیاز تحلیلی: <b>{best['score']:.1f}/100</b>\n\n"
-        "📊 <b>اندیکاتورها</b>\n"
-        f"RSI 15m: <code>{best['rsi15']:.1f}</code>\n"
-        f"RSI 1h: <code>{best['rsi1h']:.1f}</code>\n"
-        f"EMA20 15m: <code>{price_text(best['ema20_15'])}</code>\n"
-        f"EMA50 15m: <code>{price_text(best['ema50_15'])}</code>\n"
-        f"EMA20 1h: <code>{price_text(best['ema20_1h'])}</code>\n"
-        f"EMA50 1h: <code>{price_text(best['ema50_1h'])}</code>\n\n"
-        "🧱 <b>حمایت و مقاومت تخمینی</b>\n"
-        f"حمایت: <code>{price_text(best['support'])}</code>\n"
-        f"فاصله تا حمایت: {best['support_pct']:.2f}%\n"
-        f"مقاومت: <code>{price_text(best['resistance'])}</code>\n"
-        f"فاصله تا مقاومت: {best['resistance_pct']:.2f}%\n\n"
-        "🎯 <b>اهداف فرضی</b>\n"
-        f"TP1: <code>{price_text(best['tp1'])}</code>\n"
-        f"TP2: <code>{price_text(best['tp2'])}</code>\n"
-        f"TP3: <code>{price_text(best['tp3'])}</code>\n\n"
-        "ℹ️ TP1 و TP2 قبل از مانع نزدیک قرار گرفته‌اند؛ TP3 همان سطح تخمینی حمایت/مقاومت است.\n"
-        "این اهداف تضمین‌شده نیستند و حد ضرر محاسبه نشده است.\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"منبع: {source}\n"
-        f"بازارهای بررسی‌شده: {checked} | خطاها: {failures}\n"
-        f"زمان: {now}\n\n"
-        "🧪 <b>PAPER ANALYSIS ONLY</b>\n"
-        "🚫 سفارش واقعی: خاموش"
+        f"<b>{BOT_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{s['side']} | "
+        f"{escape_html(s['symbol'])}</b>\n"
+        f"⭐ امتیاز: <b>{s['score']}/100</b>\n"
+        f"📌 قدرت: {strength}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Entry: <code>{fmt(s['entry'])}</code>\n"
+        f"🛑 SL: <code>{fmt(s['sl'])}</code>\n"
+        f"🥇 TP1: <code>{fmt(s['tp1'])}</code>\n"
+        f"🥈 TP2: <code>{fmt(s['tp2'])}</code>\n"
+        f"🥉 TP3: <code>{fmt(s['tp3'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 RSI 15m: {s['rsi15']:.1f}\n"
+        f"📊 RSI 1h: {s['rsi1h']:.1f}\n"
+        f"📦 حجم/میانگین: {s['volume_ratio']:.2f}x\n"
+        f"⚖️ R/R تا TP1: {s['rr']:.2f}\n"
+        f"💵 مارجین تخمینی: {s['margin']:.2f} USDT\n"
+        f"📈 ارزش موقعیت: {s['notional']:.2f} USDT\n"
+        f"⚠️ ریسک تا SL: {s['risk']:.2f} USDT\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>دلایل سیگنال</b>\n{reasons}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧪 PAPER TRADING ONLY\n"
+        f"🚫 سفارش واقعی غیرفعال است"
     )
 
 
-# -------------------- MAIN --------------------
+# ---------------- SCAN ENGINE ----------------
 
-def main():
-    source, markets, candle_fetcher = load_markets()
+def run_scan():
+    start = time.time()
 
-    candidates = []
-    failures = 0
-    reasons = {}
+    telegram_send(
+        f"<b>{BOT_NAME}</b>\n"
+        f"🔎 اسکن بازار آغاز شد\n"
+        f"🧪 آزمایشی | بدون سفارش واقعی"
+    )
+
+    markets = load_markets()
+    markets = markets[:MAX_MARKETS]
+
+    signals = []
+    rejected = []
+    errors = 0
 
     for market in markets:
         try:
-            result, reason = analyze_market(market, candle_fetcher)
+            result = analyze_market(market)
 
-            if result is not None:
-                candidates.append(result)
-            elif reason:
-                reasons[reason] = reasons.get(reason, 0) + 1
+            if result["side"] in ("LONG", "SHORT"):
+                signals.append(result)
+            else:
+                rejected.append(
+                    (result["symbol"], result["reason"])
+                )
 
         except Exception as exc:
-            failures += 1
+            errors += 1
             logging.warning(
-                "Failed %s: %s",
-                market.get("symbol", "UNKNOWN"),
-                exc
+                "%s analysis failed: %s",
+                market["symbol"],
+                exc,
             )
 
-        time.sleep(PAUSE_BETWEEN_MARKETS)
+        time.sleep(0.15)
 
-    candidates.sort(
+    signals.sort(
         key=lambda item: item["score"],
-        reverse=True
+        reverse=True,
     )
 
-    # One best candidate, or WAIT when no market qualifies.
-    best = candidates[0] if candidates else None
+    selected = signals[:MAX_SIGNALS]
 
-    message = build_report(
-        best,
-        source,
-        len(markets),
-        failures,
-        reasons
+    for signal in selected:
+        telegram_send(signal_message(signal))
+        time.sleep(0.5)
+
+    status = (
+        "✅ سیگنال ارسال شد"
+        if selected
+        else "⚪ WAIT — سیگنال معتبر پیدا نشد"
     )
 
-    send_telegram(message)
+    report = (
+        f"<b>{BOT_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>گزارش اسکن بازار</b>\n"
+        f"{status}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔎 بازارهای بررسی‌شده: {len(markets)}\n"
+        f"📈 سیگنال‌های معتبر: {len(signals)}\n"
+        f"📨 سیگنال‌های ارسالی: {len(selected)}\n"
+        f"⚪ بازارهای ردشده: {len(rejected)}\n"
+        f"⚠️ خطاهای تحلیل: {errors}\n"
+        f"⏱ زمان اسکن: {time.time() - start:.1f} ثانیه\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT\n"
+        f"⚙️ اهرم محاسباتی: {LEVERAGE}x\n"
+        f"🧪 Paper Trading: ON\n"
+        f"🚫 Real Orders: OFF"
+    )
+
+    if rejected:
+        report += "\n\n<b>نمونه دلایل WAIT</b>\n"
+
+        for symbol, reason in rejected[:5]:
+            report += (
+                f"• {escape_html(symbol)}: "
+                f"{escape_html(reason)}\n"
+            )
+
+    telegram_send(report)
 
     logging.info(
-        "Finished: source=%s checked=%s candidates=%s failures=%s",
-        source, len(markets), len(candidates), failures
+        "Scan complete: markets=%s signals=%s errors=%s",
+        len(markets),
+        len(selected),
+        errors,
     )
+
+
+# ---------------- ENTRY POINT ----------------
+
+def main():
+    if not PAPER_MODE or REAL_ORDERS_ENABLED:
+        raise RuntimeError(
+            "Safety check failed: paper mode is required"
+        )
+
+    command = os.getenv(
+        "BOT_COMMAND", "scan"
+    ).strip().lower()
+
+    if command == "test":
+        telegram_send(
+            f"<b>{BOT_NAME}</b>\n"
+            f"✅ اتصال تلگرام آزمایش شد\n"
+            f"🧪 حالت آزمایشی فعال\n"
+            f"🚫 سفارش واقعی غیرفعال"
+        )
+        return
+
+    if command == "status":
+        telegram_send(
+            f"<b>{BOT_NAME}</b>\n"
+            f"💰 سرمایه: {CAPITAL_USDT} USDT\n"
+            f"⚙️ اهرم: {LEVERAGE}x\n"
+            f"🧪 Paper Trading: ON\n"
+            f"🚫 Real Orders: OFF"
+        )
+        return
+
+    run_scan()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except Exception as exc:
+        logging.exception("Bot failed")
+
+        telegram_send(
+            f"<b>{BOT_NAME}</b>\n"
+            f"❌ <b>اسکن کامل نشد</b>\n"
+            f"علت: <code>{escape_html(str(exc)[:800])}</code>\n"
+            f"🧪 حالت آزمایشی فعال است\n"
+            f"🚫 هیچ سفارش واقعی ثبت نشده است"
+        )
+
+        raise
