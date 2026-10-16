@@ -1,8 +1,7 @@
 
 # ============================================================
-# 🐋 ETH WHALE — BITPIN SMART MARKET WATCH
-# PAPER TRADING ONLY — NO REAL ORDERS
-# PART 1/5: CONFIGURATION & CONNECTIONS
+# ETH WHALE - BITPIN SMART MARKET WATCH
+# PAPER TRADING ONLY - NO REAL ORDERS
 # ============================================================
 
 import os
@@ -12,113 +11,140 @@ from datetime import datetime, timezone
 
 import requests
 
-# -------------------- API SETTINGS --------------------------
+# -------------------- CONFIGURATION -------------------------
 
-BITPIN_BASE = "https://api.bitpin.org"
-BINANCE_BASE = "https://api.binance.com"
+BOT_NAME = "ETH WHALE"
 
-# -------------------- TELEGRAM SETTINGS ---------------------
+BITPIN_BASE = "https://api.bitpin.ir"
+TELEGRAM_API = "https://api.telegram.org"
 
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
-    or ""
-).strip()
-
-CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID")
-    or os.getenv("CHAT_ID")
-    or ""
-).strip()
-
-# -------------------- PAPER TRADING -------------------------
-
+# Paper trading configuration
 PAPER_MODE = True
 REAL_ORDERS_ENABLED = False
 
-CAPITAL_USDT = 48.0
+PAPER_CAPITAL = 48.0
 LEVERAGE = 3
-POSITION_VALUE_USDT = CAPITAL_USDT * LEVERAGE
+POSITION_MARGIN = PAPER_CAPITAL
+POSITION_VALUE = POSITION_MARGIN * LEVERAGE
 
-# -------------------- MARKET SETTINGS -----------------------
+# Balanced signal filtering
+MIN_SIGNAL_SCORE = 60
+STRONG_SIGNAL_SCORE = 75
 
-MAX_MARKETS = 15
-CANDLE_LIMIT = 100
-
-TIMEFRAMES = {
-    "15m": "15m",
-    "1h": "1h",
-}
-
+# Technical analysis
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_PERIOD = 14
 
-MIN_SIGNAL_SCORE = 60
-STRONG_SIGNAL_SCORE = 75
+TIMEFRAME_FAST = "15m"
+TIMEFRAME_SLOW = "1h"
 
-MIN_VOLUME_RATIO = 1.05
+# Risk management
+STOP_LOSS_ATR_MULTIPLIER = 1.5
+TAKE_PROFIT_R_MULTIPLIERS = [1.0, 2.0, 3.0]
 
-# -------------------- RISK SETTINGS -------------------------
-
-STOP_LOSS_PERCENT = 1.5
-TP1_PERCENT = 1.5
-TP2_PERCENT = 3.0
-TP3_PERCENT = 4.5
-
-# -------------------- REQUEST SETTINGS ----------------------
-
-REQUEST_TIMEOUT = 10
+# Market scanning
+MAX_MARKETS = 100
+MAX_SIGNALS_PER_SCAN = 5
+REQUEST_TIMEOUT = 15
 REQUEST_DELAY = 0.15
 
-# -------------------- LOGGING -------------------------------
+# Telegram credentials are configured in GitHub Secrets
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# -------------------- LOGGING --------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-log = logging.getLogger("ETH_WHALE")
+logger = logging.getLogger("ETH_WHALE")
 
-# -------------------- HTTP SESSION --------------------------
+# -------------------- HTTP SESSION ----------------------------
 
 SESSION = requests.Session()
 
 SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-Paper-Bot/1.0",
+    "User-Agent": "ETH-WHALE-PaperSignalBot/1.0",
     "Accept": "application/json",
 })
 
-# -------------------- SAFETY CHECK --------------------------
+# -------------------- SAFETY CHECK ----------------------------
 
 if REAL_ORDERS_ENABLED:
     raise RuntimeError(
-        "Safety error: real trading must remain disabled."
+        "Safety stop: this bot must never place real orders."
     )
 
 if not PAPER_MODE:
     raise RuntimeError(
-        "Safety error: PAPER_MODE must remain True."
+        "Safety stop: paper trading mode must remain enabled."
     )
 
 
-def utc_now():
-    """Return current UTC time as a readable string."""
+def now_utc():
+    """Return current UTC time."""
     return datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
 
-def http_get_json(url, params=None):
-    """GET JSON safely; raise an error on HTTP/API failures."""
+def log_status(message):
+    """Write a status message to the log."""
+    logger.info(message)
+
+
+def get_json(url, params=None):
+    """Perform a read-only HTTP GET request."""
     response = SESSION.get(
         url,
         params=params,
         timeout=REQUEST_TIMEOUT,
     )
-
     response.raise_for_status()
     return response.json()
+
+
+def telegram_send(text):
+    """Send a Telegram message if credentials are configured."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning(
+            "Telegram credentials missing; message not sent."
+        )
+        return False
+
+    url = (
+        f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        response = SESSION.post(
+            url,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            logger.error("Telegram API returned an error.")
+            return False
+
+        return True
+
+    except requests.RequestException as exc:
+        logger.error("Telegram connection failed: %s", exc)
+        return False
 
 
 def format_price(value):
@@ -126,9 +152,8 @@ def format_price(value):
     try:
         return f"{float(value):,.8f}".rstrip("0").rstrip(".")
     except (TypeError, ValueError):
-        return "N/A"
+        return str(value)
 
 
-def format_usdt(value):
-    """Format a USDT amount."""
-    return f"{float(value):,.2f} USDT"
+# End of Part 1
+# Parts 2-5 will be added below this line.
