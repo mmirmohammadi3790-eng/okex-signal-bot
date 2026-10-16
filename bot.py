@@ -5,10 +5,10 @@ import logging
 import requests
 from datetime import datetime, timezone
 
-# =========================================================
-# BITPIN PAPER SIGNAL BOT
-# PAPER TRADING ONLY - NO REAL ORDERS
-# =========================================================
+# ==========================================================
+# BITPIN PAPER SIGNAL BOT - DIAGNOSTIC VERSION
+# PAPER ONLY - NO REAL ORDERS
+# ==========================================================
 
 BASE_URL = "https://api.bitpin.ir"
 
@@ -16,11 +16,10 @@ CAPITAL = 48.0
 LEVERAGE = 3
 POSITION_SIZE = CAPITAL * LEVERAGE
 
-MAX_MARKETS = 100
+MAX_MARKETS = 30
 MAX_SIGNALS = 5
 MIN_SCORE = 60
-SCAN_INTERVAL = 300
-TIMEOUT = 15
+TIMEOUT = 8
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -30,12 +29,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-http = requests.Session()
-http.headers.update({"User-Agent": "Bitpin-Paper-Bot/1.0"})
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Bitpin-Paper-Diagnostic-Bot/2.0"
+})
 
 
 def api_get(path, params=None):
-    response = http.get(
+    response = session.get(
         BASE_URL + path,
         params=params,
         timeout=TIMEOUT
@@ -46,8 +47,8 @@ def api_get(path, params=None):
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram not configured.")
-        return
+        logging.warning("Telegram credentials not configured.")
+        return False
 
     try:
         response = requests.post(
@@ -62,19 +63,25 @@ def send_telegram(message):
         )
         response.raise_for_status()
 
-        if not response.json().get("ok"):
-            logging.error("Telegram did not accept message.")
+        if response.json().get("ok"):
+            return True
 
+        logging.error("Telegram API returned ok=false")
     except Exception as exc:
-        logging.error("Telegram error: %s", exc)
+        logging.error("Telegram send failed: %s", exc)
+
+    return False
 
 
-def as_float(value):
+def number(value):
     try:
         result = float(value)
-        return result if result > 0 else None
+        if result > 0:
+            return result
     except (TypeError, ValueError):
-        return None
+        pass
+
+    return None
 
 
 def extract_list(data, keys):
@@ -91,7 +98,7 @@ def extract_list(data, keys):
 
 
 def get_markets():
-    last_error = None
+    last_error = "Unknown error"
 
     for path in (
         "/v1/mkt/markets/",
@@ -99,19 +106,22 @@ def get_markets():
     ):
         try:
             data = api_get(path)
-            markets = extract_list(
+            rows = extract_list(
                 data, ("results", "markets", "data")
             )
-            if markets:
-                return markets
-        except Exception as exc:
-            last_error = exc
 
-    raise RuntimeError("Markets API failed: " + str(last_error))
+            if rows:
+                logging.info("Markets endpoint: %s", path)
+                return rows
+
+        except Exception as exc:
+            last_error = str(exc)
+
+    raise RuntimeError("Markets API failed: " + last_error)
 
 
 def get_tickers():
-    last_error = None
+    last_error = "Unknown error"
 
     for path in (
         "/v1/mkt/tickers/",
@@ -124,19 +134,20 @@ def get_tickers():
                 for key in ("tickers", "results", "data"):
                     value = data.get(key)
 
-                    if isinstance(value, (dict, list)) and value:
+                    if isinstance(value, (list, dict)) and value:
+                        logging.info("Tickers endpoint: %s", path)
                         return value
 
             if isinstance(data, list) and data:
                 return data
 
         except Exception as exc:
-            last_error = exc
+            last_error = str(exc)
 
-    raise RuntimeError("Ticker API failed: " + str(last_error))
+    raise RuntimeError("Ticker API failed: " + last_error)
 
 
-def get_symbol(market):
+def market_symbol(market):
     if not isinstance(market, dict):
         return ""
 
@@ -148,8 +159,7 @@ def get_symbol(market):
 
 
 def is_usdt_market(market):
-    symbol = get_symbol(market)
-
+    symbol = market_symbol(market)
     quote = str(
         market.get("quote_currency")
         or market.get("quote")
@@ -172,7 +182,7 @@ def normalize_symbol(symbol):
     )
 
 
-def make_ticker_map(data):
+def build_ticker_map(data):
     result = {}
 
     if isinstance(data, dict):
@@ -182,14 +192,17 @@ def make_ticker_map(data):
 
     elif isinstance(data, list):
         for item in data:
-            if isinstance(item, dict):
-                symbol = (
-                    item.get("symbol")
-                    or item.get("market")
-                    or item.get("code")
-                )
-                if symbol:
-                    result[str(symbol).upper()] = item
+            if not isinstance(item, dict):
+                continue
+
+            symbol = (
+                item.get("symbol")
+                or item.get("market")
+                or item.get("code")
+            )
+
+            if symbol:
+                result[str(symbol).upper()] = item
 
     return result
 
@@ -205,63 +218,109 @@ def get_price(ticker):
         "close",
         "lastPrice"
     ):
-        value = as_float(ticker.get(key))
+        value = number(ticker.get(key))
         if value:
             return value
 
     return None
 
 
-def get_candles(symbol):
-    """
-    Try common candle endpoint formats.
-    The endpoint and response format must be verified
-    against the current Bitpin API.
-    """
-
-    market = normalize_symbol(symbol)
-
-    paths = (
-        "/v1/mkt/ohlcv/",
-        "/v1/mkt/candles/",
-        "/api/v1/mkt/candles/"
+def parse_candles(data):
+    rows = extract_list(
+        data,
+        ("results", "candles", "data", "ohlcv")
     )
 
-    for path in paths:
-        for params in (
-            {"market": market, "interval": "1h", "limit": 100},
-            {"symbol": market, "interval": "1h", "limit": 100}
-        ):
-            try:
-                data = api_get(path, params)
+    closes = []
+    timestamps = []
 
-                rows = extract_list(
-                    data, ("results", "candles", "data", "ohlcv")
-                )
+    for row in rows:
+        if isinstance(row, dict):
+            close = row.get("close")
+            if close is None:
+                close = row.get("c")
 
-                closes = []
+            stamp = (
+                row.get("timestamp")
+                or row.get("time")
+                or row.get("start_time")
+            )
 
-                for row in rows:
-                    if isinstance(row, dict):
-                        value = row.get("close", row.get("c"))
+        elif isinstance(row, (list, tuple)) and len(row) >= 5:
+            # Common OHLCV layout:
+            # [timestamp, open, high, low, close, volume]
+            stamp = row[0]
+            close = row[4]
 
-                    elif isinstance(row, (list, tuple)) and len(row) >= 5:
-                        value = row[4]
+        else:
+            continue
 
-                    else:
-                        continue
+        price = number(close)
 
-                    price = as_float(value)
-                    if price:
-                        closes.append(price)
+        if price is not None:
+            closes.append(price)
+            timestamps.append(stamp)
 
-                if len(closes) >= 30:
-                    return closes
+    # Put candles in chronological order when timestamps
+    # are available and numeric.
+    if len(closes) >= 2:
+        try:
+            first = float(timestamps[0])
+            last = float(timestamps[-1])
 
-            except Exception:
-                continue
+            if first > last:
+                closes.reverse()
+        except (TypeError, ValueError):
+            pass
 
-    return None
+    return closes
+
+
+def get_candles(symbol):
+    market = normalize_symbol(symbol)
+
+    # API variations are attempted for diagnosis.
+    attempts = [
+        (
+            "/v1/mkt/ohlcv/",
+            {"market": market, "interval": "1h"}
+        ),
+        (
+            "/v1/mkt/candles/",
+            {"market": market, "interval": "1h"}
+        ),
+        (
+            "/api/v1/mkt/candles/",
+            {"market": market, "interval": "1h"}
+        ),
+        (
+            "/v1/mkt/ohlcv/",
+            {"symbol": market, "interval": "1h"}
+        ),
+        (
+            "/v1/mkt/candles/",
+            {"symbol": market, "interval": "1h"}
+        )
+    ]
+
+    errors = []
+
+    for path, params in attempts:
+        try:
+            data = api_get(path, params)
+            closes = parse_candles(data)
+
+            if len(closes) >= 30:
+                return closes, None
+
+            errors.append(
+                path + ": response had fewer than 30 usable candles"
+            )
+
+        except Exception as exc:
+            errors.append(path + ": " + str(exc)[:100])
+
+    return None, "; ".join(errors[:3])
 
 
 def calculate_rsi(closes, period=14):
@@ -275,8 +334,8 @@ def calculate_rsi(closes, period=14):
 
     recent = changes[-period:]
 
-    gains = [max(x, 0) for x in recent]
-    losses = [max(-x, 0) for x in recent]
+    gains = [max(change, 0) for change in recent]
+    losses = [max(-change, 0) for change in recent]
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
@@ -284,8 +343,9 @@ def calculate_rsi(closes, period=14):
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    relative_strength = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + relative_strength))
 
 
 def calculate_ema(values, period):
@@ -304,20 +364,17 @@ def calculate_ema(values, period):
     return current
 
 
-def analyze_market(symbol, current_price):
-    closes = get_candles(symbol)
+def analyze_market(symbol, price, closes):
+    # Replace last candle close with current ticker price.
+    closes = list(closes)
+    closes[-1] = price
 
-    if not closes or len(closes) < 30:
-        return None
-
-    closes[-1] = current_price
-
-    rsi_value = calculate_rsi(closes, 14)
+    rsi_value = calculate_rsi(closes)
     ema9 = calculate_ema(closes, 9)
     ema21 = calculate_ema(closes, 21)
 
     if rsi_value is None or ema9 is None or ema21 is None:
-        return None
+        return None, "indicators unavailable"
 
     long_score = 0
     short_score = 0
@@ -327,15 +384,14 @@ def analyze_market(symbol, current_price):
     elif ema9 < ema21:
         short_score += 30
 
-    if current_price > ema9:
+    if price > ema9:
         long_score += 20
-    elif current_price < ema9:
+    elif price < ema9:
         short_score += 20
 
     if 50 <= rsi_value <= 68:
         long_score += 25
-
-    if 32 <= rsi_value < 50:
+    elif 32 <= rsi_value < 50:
         short_score += 25
 
     if closes[-1] > closes[-2]:
@@ -356,103 +412,124 @@ def analyze_market(symbol, current_price):
         score = short_score
 
     if score < MIN_SCORE:
-        return None
+        return None, (
+            f"score below threshold "
+            f"(long={long_score}, short={short_score})"
+        )
 
     if direction == "LONG":
-        stop = current_price * 0.985
+        stop = price * 0.985
         targets = [
-            current_price * 1.02,
-            current_price * 1.03,
-            current_price * 1.045
+            price * 1.02,
+            price * 1.03,
+            price * 1.045
         ]
     else:
-        stop = current_price * 1.015
+        stop = price * 1.015
         targets = [
-            current_price * 0.98,
-            current_price * 0.97,
-            current_price * 0.955
+            price * 0.98,
+            price * 0.97,
+            price * 0.955
         ]
 
-    # Approximate P/L on a 144 USDT notional position.
-    # Do not multiply by leverage a second time.
-    stop_loss = POSITION_SIZE * 0.015
-
-    target_pnl = [
-        POSITION_SIZE * abs(target / current_price - 1)
-        for target in targets
-    ]
-
+    # POSITION_SIZE already includes simulated leverage.
+    # Do not multiply by leverage again.
     return {
         "symbol": symbol,
         "direction": direction,
         "score": score,
-        "price": current_price,
+        "price": price,
         "rsi": rsi_value,
         "ema9": ema9,
         "ema21": ema21,
         "stop": stop,
         "targets": targets,
-        "stop_loss": stop_loss,
-        "target_pnl": target_pnl
-    }
+        "stop_loss": POSITION_SIZE * 0.015,
+        "target_pnl": [
+            POSITION_SIZE * abs(target / price - 1)
+            for target in targets
+        ]
+    }, None
 
 
 def format_signal(s):
     t = s["targets"]
-    p = s["target_pnl"]
+    pnl = s["target_pnl"]
 
     return (
         "BITPIN PAPER SIGNAL\n"
-        "========================\n"
+        "====================\n"
         f"Market: {s['symbol']}\n"
-        f"Signal: {s['direction']}\n"
+        f"Direction: {s['direction']}\n"
         f"Score: {s['score']}/100\n"
         f"Entry reference: {s['price']:.8g}\n"
-        f"RSI 14: {s['rsi']:.2f}\n"
-        f"EMA 9: {s['ema9']:.8g}\n"
-        f"EMA 21: {s['ema21']:.8g}\n"
-        "------------------------\n"
-        f"Stop Loss: {s['stop']:.8g}\n"
+        f"RSI: {s['rsi']:.2f}\n"
+        f"EMA9: {s['ema9']:.8g}\n"
+        f"EMA21: {s['ema21']:.8g}\n"
+        "--------------------\n"
+        f"SL: {s['stop']:.8g}\n"
         f"TP1: {t[0]:.8g}\n"
         f"TP2: {t[1]:.8g}\n"
         f"TP3: {t[2]:.8g}\n"
-        "------------------------\n"
+        "--------------------\n"
         f"Virtual capital: {CAPITAL:.2f} USDT\n"
-        f"Simulated leverage: {LEVERAGE}x\n"
+        f"Leverage: {LEVERAGE}x (simulation)\n"
         f"Position notional: {POSITION_SIZE:.2f} USDT\n"
         f"Estimated SL P/L: -{s['stop_loss']:.2f} USDT\n"
-        f"Estimated TP1 P/L: +{p[0]:.2f} USDT\n"
-        f"Estimated TP2 P/L: +{p[1]:.2f} USDT\n"
-        f"Estimated TP3 P/L: +{p[2]:.2f} USDT\n"
-        "========================\n"
-        "Mode: PAPER ONLY\n"
-        "Real orders: OFF\n"
-        "Fees and slippage excluded."
+        f"Estimated TP1 P/L: +{pnl[0]:.2f} USDT\n"
+        f"Estimated TP2 P/L: +{pnl[1]:.2f} USDT\n"
+        f"Estimated TP3 P/L: +{pnl[2]:.2f} USDT\n"
+        "====================\n"
+        "PAPER ONLY - REAL ORDERS OFF\n"
+        "Fees, funding and slippage excluded."
     )
 
 
 def scan_once():
-    print("\nStarting market scan...")
-    print("UTC time:", datetime.now(timezone.utc).isoformat())
+    stats = {
+        "markets": 0,
+        "selected": 0,
+        "ticker_records": 0,
+        "prices": 0,
+        "candles_ok": 0,
+        "candles_failed": 0,
+        "analyzed": 0,
+        "long": 0,
+        "short": 0,
+        "low_score": 0,
+        "errors": 0
+    }
+
+    reasons = {}
+    signals = []
+
+    print("\n" + "=" * 50)
+    print("BITPIN PAPER BOT - DIAGNOSTIC SCAN")
+    print(datetime.now(timezone.utc).isoformat())
+    print("=" * 50)
 
     markets = get_markets()
-    tickers = make_ticker_map(get_tickers())
+    tickers = build_ticker_map(get_tickers())
+
+    stats["markets"] = len(markets)
+    stats["ticker_records"] = len(tickers)
 
     selected = [
         market for market in markets
         if is_usdt_market(market)
     ][:MAX_MARKETS]
 
-    print("Markets received:", len(markets))
-    print("USDT markets selected:", len(selected))
-    print("Ticker records:", len(tickers))
+    stats["selected"] = len(selected)
 
-    signals = []
+    print("Markets received:", stats["markets"])
+    print("Ticker records:", stats["ticker_records"])
+    print("USDT markets selected:", stats["selected"])
 
     for market in selected:
-        symbol = get_symbol(market)
+        symbol = market_symbol(market)
 
         if not symbol:
+            stats["errors"] += 1
             continue
 
         ticker = tickers.get(symbol)
@@ -460,26 +537,63 @@ def scan_once():
             ticker = tickers.get(normalize_symbol(symbol))
 
         if ticker is None:
+            stats["errors"] += 1
+            reasons["ticker missing"] = (
+                reasons.get("ticker missing", 0) + 1
+            )
             continue
 
         price = get_price(ticker)
+
         if price is None:
+            stats["errors"] += 1
+            reasons["price missing"] = (
+                reasons.get("price missing", 0) + 1
+            )
             continue
 
-        try:
-            signal = analyze_market(symbol, price)
+        stats["prices"] += 1
 
-            if signal:
-                signals.append(signal)
+        closes, candle_error = get_candles(symbol)
+
+        if not closes:
+            stats["candles_failed"] += 1
+            reasons["candles unavailable"] = (
+                reasons.get("candles unavailable", 0) + 1
+            )
+
+            if stats["candles_failed"] <= 2:
                 print(
-                    "Candidate:",
+                    "CANDLE DEBUG:",
                     symbol,
-                    signal["direction"],
-                    signal["score"]
+                    candle_error
                 )
 
-        except Exception as exc:
-            logging.warning("%s: %s", symbol, exc)
+            continue
+
+        stats["candles_ok"] += 1
+        stats["analyzed"] += 1
+
+        signal, reason = analyze_market(symbol, price, closes)
+
+        if signal is None:
+            stats["low_score"] += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+
+        signals.append(signal)
+
+        if signal["direction"] == "LONG":
+            stats["long"] += 1
+        else:
+            stats["short"] += 1
+
+        print(
+            "SIGNAL:",
+            symbol,
+            signal["direction"],
+            "score=" + str(signal["score"])
+        )
 
     signals.sort(
         key=lambda item: item["score"],
@@ -488,16 +602,54 @@ def scan_once():
 
     signals = signals[:MAX_SIGNALS]
 
-    if not signals:
-        message = (
-            "BITPIN PAPER BOT\n"
-            "Scan completed.\n"
-            "No qualifying signals found.\n"
-            "Real orders: OFF"
+    summary = [
+        "BITPIN PAPER BOT - SCAN REPORT",
+        "Mode: PAPER ONLY",
+        "Real orders: OFF",
+        f"Virtual capital: {CAPITAL:.2f} USDT",
+        f"Simulated leverage: {LEVERAGE}x",
+        "--------------------",
+        f"Markets received: {stats['markets']}",
+        f"USDT markets selected: {stats['selected']}",
+        f"Ticker records: {stats['ticker_records']}",
+        f"Markets with prices: {stats['prices']}",
+        f"Valid candle sets: {stats['candles_ok']}",
+        f"Candle failures: {stats['candles_failed']}",
+        f"Markets analyzed: {stats['analyzed']}",
+        f"LONG candidates: {stats['long']}",
+        f"SHORT candidates: {stats['short']}",
+        f"Below threshold: {stats['low_score']}",
+        f"Other errors: {stats['errors']}"
+    ]
+
+    if reasons:
+        summary.append("--------------------")
+        summary.append("Skip reasons:")
+
+        for reason, count in sorted(
+            reasons.items(),
+            key=lambda item: item[1],
+            reverse=True
+        )[:5]:
+            summary.append(f"{reason}: {count}")
+
+    if signals:
+        summary.append("--------------------")
+        summary.append(f"Signals sent: {len(signals)}")
+    elif stats["candles_ok"] == 0:
+        summary.append("--------------------")
+        summary.append(
+            "WARNING: No valid candles were parsed. "
+            "Verify the Bitpin candle API."
         )
-        print(message)
-        send_telegram(message)
-        return
+    else:
+        summary.append("--------------------")
+        summary.append("No qualifying signals in this scan.")
+
+    report = "\n".join(summary)
+
+    print("\n" + report)
+    send_telegram(report)
 
     for signal in signals:
         message = format_signal(signal)
@@ -507,32 +659,22 @@ def scan_once():
 
 
 def main():
-    print("BITPIN PAPER SIGNAL BOT STARTED")
+    print("BITPIN DIAGNOSTIC BOT STARTED")
+    print("One scan per workflow run.")
     print("Capital:", CAPITAL, "USDT")
-    print("Leverage:", LEVERAGE, "x")
-    print("Position notional:", POSITION_SIZE, "USDT")
+    print("Simulated leverage:", LEVERAGE, "x")
     print("Real orders: OFF")
 
-    while True:
-        try:
-            scan_once()
-
-        except KeyboardInterrupt:
-            print("Bot stopped.")
-            break
-
-        except Exception as exc:
-            logging.exception("Scan failed: %s", exc)
-
-            send_telegram(
-                "BITPIN PAPER BOT\n"
-                "Market scan failed.\n"
-                "Check the execution log.\n"
-                "Real orders: OFF"
-            )
-
-        print("Next scan in", SCAN_INTERVAL, "seconds.")
-        time.sleep(SCAN_INTERVAL)
+    try:
+        scan_once()
+    except Exception as exc:
+        logging.exception("Scan failed: %s", exc)
+        send_telegram(
+            "BITPIN PAPER BOT - SCAN FAILED\n"
+            + str(exc)[:500]
+            + "\nReal orders: OFF"
+        )
+        raise
 
 
 if __name__ == "__main__":
