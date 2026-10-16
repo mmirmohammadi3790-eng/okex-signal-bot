@@ -1,162 +1,138 @@
 
+# ============================================================
+# ETH WHALE | BITPIN SPOT BOT
+# Version 7.0
+# Default: PAPER ONLY
+# Real orders: disabled unless explicitly approved
+# Spot only - no leverage - no withdrawals
+# ============================================================
+
 import os
 import sys
 import time
+import json
 import logging
-import requests
+import secrets
+import statistics
 from datetime import datetime, timezone
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ============================================================
-# ETH WHALE | BITPIN SMART MARKET WATCH
-# PAPER TRADING ONLY - NO REAL ORDERS
-# ============================================================
+import requests
 
 BOT_NAME = "🐋 ETH WHALE"
 BASE_URL = "https://api.bitpin.ir"
 
+# ---------------- CONFIGURATION ----------------
+
 CAPITAL_USDT = 48.0
-LEVERAGE = 3
-MARGIN_PER_TRADE = 16.0
-POSITION_VALUE = MARGIN_PER_TRADE * LEVERAGE
+MAX_ORDER_USDT = 5.0
+MAX_DAILY_ORDERS = 3
+MAX_DAILY_LOSS_USDT = 2.0
 
-MAX_MARKETS = 220
-MAX_SIGNALS = 3
-MIN_SCORE = 60
-STRONG_SCORE = 75
+MIN_SCORE = 65
+MAX_MARKETS = 40
+REQUEST_TIMEOUT = 20
+RETRIES = 2
 
-CANDLE_LIMIT = 100
-MIN_QUOTE_VOLUME = 10000.0
-REQUEST_TIMEOUT = (8, 20)
+# Both values must be explicitly configured to allow live orders.
+# Never enable these before paper testing.
+LIVE_TRADING = (
+    os.getenv("LIVE_TRADING", "NO").strip().upper() == "YES"
+)
+LIVE_CONFIRMATION = os.getenv(
+    "LIVE_CONFIRMATION", ""
+).strip()
 
-PAPER_MODE = True
-REAL_ORDERS_ENABLED = False
+REQUIRED_CONFIRMATION = "I_APPROVE_SPOT_ORDERS"
+
+API_KEY = os.getenv("BITPIN_API_KEY", "").strip()
+API_SECRET = os.getenv("BITPIN_API_SECRET", "").strip()
 
 TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
-    or ""
-).strip()
-
-CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID")
-    or os.getenv("CHAT_ID")
-    or ""
-).strip()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    stream=sys.stdout,
+    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    or os.getenv("TELEGRAM_TOKEN", "").strip()
 )
+CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    or os.getenv("CHAT_ID", "").strip()
+)
+
+# Public API paths may change. Verify them against current
+# Bitpin documentation before relying on live execution.
+MARKETS_URLS = [
+    f"{BASE_URL}/v1/mkt/markets/",
+    f"{BASE_URL}/api/v1/mkt/markets/",
+]
+
+TICKER_URLS = [
+    f"{BASE_URL}/v1/mkt/tickers/",
+    f"{BASE_URL}/api/v1/mkt/tickers/",
+]
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-PaperBot/2.0",
+    "User-Agent": "ETH-WHALE/7.0",
     "Accept": "application/json",
 })
 
-retry = Retry(
-    total=2,
-    connect=2,
-    read=2,
-    backoff_factor=0.7,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET"]),
-    respect_retry_after_header=True,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-adapter = HTTPAdapter(max_retries=retry)
-SESSION.mount("https://", adapter)
-SESSION.mount("http://", adapter)
+# ---------------- UTILITIES ----------------
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+def notify(message):
+    logging.info(message.replace("\n", " | "))
 
-def telegram_send(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("Telegram credentials missing.")
         return False
-
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
-    )
 
     try:
         response = SESSION.post(
-            url,
+            "https://api.telegram.org/bot"
+            + TELEGRAM_TOKEN + "/sendMessage",
             json={
                 "chat_id": CHAT_ID,
                 "text": message,
-                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
-            timeout=REQUEST_TIMEOUT,
+            timeout=15,
         )
         response.raise_for_status()
-
-        result = response.json()
-
-        if not result.get("ok"):
-            logging.error("Telegram rejected message.")
-            return False
-
-        logging.info("Telegram message sent.")
-        return True
-
+        return response.json().get("ok", False)
     except Exception as exc:
-        logging.error("Telegram error: %s", exc)
+        logging.error("Telegram send failed: %s", exc)
         return False
 
 
-# ============================================================
-# HTTP HELPERS
-# ============================================================
+def http_json(url, params=None):
+    last_error = "Unknown error"
 
-def api_get(path, params=None):
-    url = BASE_URL.rstrip("/") + "/" + path.lstrip("/")
-    response = SESSION.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(RETRIES + 1):
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
 
+            if response.status_code in (400, 404, 405, 422):
+                return None, f"HTTP {response.status_code}"
 
-def extract_list(data, keys=()):
-    if isinstance(data, list):
-        return data
+            response.raise_for_status()
+            return response.json(), None
 
-    if isinstance(data, dict):
-        for key in keys:
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < RETRIES:
+                time.sleep(1 + attempt * 2)
 
-        for key in ("results", "data", "items"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-
-    return []
-
-
-def first_value(obj, *keys):
-    if not isinstance(obj, dict):
-        return None
-
-    for key in keys:
-        value = obj.get(key)
-        if value is not None and value != "":
-            return value
-
-    return None
+    return None, last_error
 
 
 def as_float(value, default=0.0):
@@ -166,365 +142,262 @@ def as_float(value, default=0.0):
         return default
 
 
+def get_rows(data, keys):
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+        for key in ("data", "result", "results"):
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return value
+
+            if isinstance(value, dict):
+                for subkey in keys:
+                    if isinstance(value.get(subkey), list):
+                        return value[subkey]
+
+    return []
+
+
 def normalize_symbol(value):
-    if not value:
-        return ""
-
-    return (
-        str(value)
-        .upper()
-        .replace("/", "_")
-        .replace("-", "_")
-        .replace(" ", "")
-    )
+    return str(value or "").upper().strip().replace("/", "_")
 
 
-def currency_code(value):
-    if isinstance(value, dict):
-        return first_value(value, "code", "symbol", "name")
-    return value
+def is_usdt_spot_symbol(symbol):
+    symbol = normalize_symbol(symbol)
+
+    if not symbol.endswith("_USDT"):
+        return False
+
+    if symbol in {
+        "USDT_USDT", "USDC_USDT", "DAI_USDT",
+        "TUSD_USDT", "FDUSD_USDT",
+    }:
+        return False
+
+    return True
 
 
-# ============================================================
-# MARKET DISCOVERY
-# ============================================================
+# ---------------- MARKET DATA ----------------
 
 def get_markets():
-    paths = (
-        "/v1/mkt/markets/",
-        "/api/v1/mkt/markets/",
-        "/api/v1/spot/public/pairs",
-    )
+    errors = []
 
-    last_error = None
+    for url in MARKETS_URLS:
+        data, error = http_json(url)
 
-    for path in paths:
-        for attempt in range(2):
-            try:
-                logging.info(
-                    "Requesting markets: %s attempt=%d",
-                    path, attempt + 1,
-                )
-
-                data = api_get(path)
-                rows = extract_list(
-                    data,
-                    ("results", "markets", "pairs", "data"),
-                )
-
-                if not rows:
-                    logging.warning(
-                        "No market rows returned by %s", path
-                    )
-                    break
-
-                unique = {}
-
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-
-                    symbol = first_value(
-                        row, "symbol", "code", "name", "market"
-                    )
-
-                    if not symbol:
-                        base = currency_code(first_value(
-                            row, "base_currency", "base", "currency1"
-                        ))
-                        quote = currency_code(first_value(
-                            row, "quote_currency", "quote", "currency2"
-                        ))
-
-                        if base and quote:
-                            symbol = f"{base}_{quote}"
-
-                    symbol = normalize_symbol(symbol)
-
-                    if not symbol:
-                        continue
-
-                    if not (
-                        symbol.endswith("_USDT")
-                        or symbol.endswith("USDT")
-                    ):
-                        continue
-
-                    base_symbol = (
-                        symbol[:-5]
-                        if symbol.endswith("_USDT")
-                        else symbol[:-4]
-                    )
-
-                    if base_symbol in {
-                        "USDT", "USDC", "BUSD", "DAI",
-                        "TUSD", "FDUSD", "USDE",
-                    }:
-                        continue
-
-                    unique[symbol] = {
-                        "symbol": symbol,
-                        "raw": row,
-                    }
-
-                markets = list(unique.values())
-
-                if markets:
-                    logging.info(
-                        "Markets discovered: %d via %s",
-                        len(markets), path,
-                    )
-                    return markets[:MAX_MARKETS]
-
-                logging.warning(
-                    "No USDT markets parsed from %s", path
-                )
-                break
-
-            except Exception as exc:
-                last_error = exc
-                logging.warning(
-                    "Market endpoint failed: %s | %s",
-                    path, exc,
-                )
-                if attempt == 0:
-                    time.sleep(2)
-
-    raise RuntimeError(
-        "Could not retrieve Bitpin markets. Last error: "
-        + str(last_error)
-    )
-
-
-# ============================================================
-# TICKERS
-# ============================================================
-
-def get_tickers():
-    paths = (
-        "/v1/mkt/tickers/",
-        "/api/v1/mkt/tickers/",
-        "/api/v1/spot/public/tickers",
-    )
-
-    last_error = None
-
-    for path in paths:
-        try:
-            data = api_get(path)
-
-            if isinstance(data, dict):
-                rows = extract_list(
-                    data, ("tickers", "results", "data")
-                )
-
-                if not rows and isinstance(
-                    data.get("tickers"), dict
-                ):
-                    rows = list(data["tickers"].values())
-            else:
-                rows = extract_list(data)
-
-            if not rows:
-                logging.warning(
-                    "No ticker rows from %s", path
-                )
-                continue
-
-            output = {}
-
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-
-                symbol = first_value(
-                    row, "symbol", "market", "code", "name"
-                )
-
-                if not symbol:
-                    continue
-
-                output[normalize_symbol(symbol)] = row
-
-            if output:
-                logging.info(
-                    "Tickers received: %d via %s",
-                    len(output), path,
-                )
-                return output
-
-        except Exception as exc:
-            last_error = exc
-            logging.warning(
-                "Ticker endpoint failed: %s | %s",
-                path, exc,
-            )
-
-    raise RuntimeError(
-        "Could not retrieve Bitpin tickers. Last error: "
-        + str(last_error)
-    )
-
-
-def ticker_for(symbol, tickers):
-    if symbol in tickers:
-        return tickers[symbol]
-
-    compact = symbol.replace("_", "").replace("-", "")
-
-    for key, value in tickers.items():
-        if key.replace("_", "").replace("-", "") == compact:
-            return value
-
-    return {}
-
-
-def get_quote_volume(symbol, ticker):
-    value = first_value(
-        ticker,
-        "quote_volume",
-        "quoteVolume",
-        "volume_quote",
-        "quote_asset_volume",
-        "turnover",
-        "quoteVolume24h",
-    )
-
-    if value is not None:
-        return as_float(value)
-
-    base_volume = as_float(first_value(
-        ticker, "volume", "base_volume", "baseVolume", "volume24h"
-    ))
-
-    price = as_float(first_value(
-        ticker, "last", "last_price", "price", "close", "lastPrice"
-    ))
-
-    return base_volume * price
-
-
-# ============================================================
-# CANDLES
-# ============================================================
-
-def parse_candle_rows(data):
-    rows = extract_list(
-        data, ("results", "candles", "data", "items")
-    )
-
-    if not rows and isinstance(data, dict):
-        for value in data.values():
-            if isinstance(value, list):
-                rows = value
-                break
-
-    candles = []
-
-    for row in rows:
-        try:
-            if isinstance(row, dict):
-                o = first_value(row, "open", "o")
-                h = first_value(row, "high", "h")
-                low = first_value(row, "low", "l")
-                c = first_value(row, "close", "c")
-                v = first_value(
-                    row, "volume", "v", "base_volume"
-                )
-
-            elif isinstance(row, (list, tuple)) and len(row) >= 5:
-                # Expected ordering:
-                # timestamp, open, high, low, close, volume
-                _, o, h, low, c = row[:5]
-                v = row[5] if len(row) > 5 else 0
-
-            else:
-                continue
-
-            o = as_float(o)
-            h = as_float(h)
-            low = as_float(low)
-            c = as_float(c)
-            v = as_float(v)
-
-            if min(o, h, low, c) <= 0:
-                continue
-
-            candles.append({
-                "open": o,
-                "high": h,
-                "low": low,
-                "close": c,
-                "volume": max(v, 0.0),
-            })
-
-        except Exception:
+        if data is None:
+            errors.append(f"{url}: {error}")
             continue
 
-    return candles
+        rows = get_rows(
+            data, ("markets", "pairs", "results", "data")
+        )
 
+        markets = []
 
-def get_candles(symbol, timeframe):
-    interval_candidates = {
-        "15m": ("15m", "15", "15min"),
-        "1h": ("1h", "60"),
-    }
+        for item in rows:
+            if isinstance(item, str):
+                symbol = normalize_symbol(item)
+                active = True
+            elif isinstance(item, dict):
+                symbol = normalize_symbol(
+                    item.get("symbol")
+                    or item.get("code")
+                    or item.get("market")
+                    or item.get("name")
+                )
 
-    paths = (
-        "/v1/mkt/ohlcv/",
-        "/api/v1/mkt/ohlcv/",
-        "/api/v1/mkt/candles/",
-        "/api/v1/spot/public/candles",
-    )
+                status = str(item.get("status", "")).lower()
+                active = (
+                    item.get("is_active") is not False
+                    and item.get("active") is not False
+                    and status not in {
+                        "inactive", "disabled", "closed",
+                        "delisted",
+                    }
+                )
 
-    last_error = None
+                quote = str(
+                    item.get("quote_currency")
+                    or item.get("quote")
+                    or ""
+                ).upper()
 
-    for path in paths:
-        for interval in interval_candidates[timeframe]:
-            # Try the most common parameter format first.
-            params_candidates = (
-                {
-                    "market": symbol,
-                    "interval": interval,
-                    "limit": CANDLE_LIMIT,
-                },
-                {
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": CANDLE_LIMIT,
-                },
-                {
-                    "market": symbol,
-                    "resolution": interval,
-                    "limit": CANDLE_LIMIT,
-                },
-            )
+                if quote and quote != "USDT":
+                    continue
+            else:
+                continue
 
-            for params in params_candidates:
-                try:
-                    data = api_get(path, params=params)
-                    candles = parse_candle_rows(data)
+            if active and is_usdt_spot_symbol(symbol):
+                markets.append(symbol)
 
-                    if len(candles) >= 55:
-                        return candles[-CANDLE_LIMIT:]
-
-                    logging.debug(
-                        "Insufficient candles: %s %s %d",
-                        symbol, timeframe, len(candles),
-                    )
-
-                except Exception as exc:
-                    last_error = exc
+        if markets:
+            return list(dict.fromkeys(markets))
 
     raise RuntimeError(
-        f"No usable candles for {symbol} {timeframe}: "
-        f"{last_error}"
+        "Could not retrieve markets: " + " | ".join(errors)
     )
 
 
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
+def get_tickers():
+    errors = []
+
+    for url in TICKER_URLS:
+        data, error = http_json(url)
+
+        if data is None:
+            errors.append(f"{url}: {error}")
+            continue
+
+        raw = data
+
+        if isinstance(data, dict):
+            raw = (
+                data.get("tickers")
+                or data.get("data")
+                or data.get("results")
+                or data.get("result")
+                or data
+            )
+
+        result = {}
+
+        if isinstance(raw, dict):
+            items = []
+            for symbol, value in raw.items():
+                if isinstance(value, dict):
+                    row = dict(value)
+                    row.setdefault("symbol", symbol)
+                    items.append(row)
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = normalize_symbol(
+                item.get("symbol")
+                or item.get("market")
+                or item.get("name")
+                or item.get("pair")
+            )
+
+            price = as_float(
+                item.get("last_price")
+                or item.get("last")
+                or item.get("price")
+                or item.get("close")
+            )
+
+            volume = as_float(
+                item.get("quote_volume")
+                or item.get("quoteVolume")
+                or item.get("volume_quote")
+                or item.get("volume")
+            )
+
+            if symbol and price > 0:
+                result[symbol] = {
+                    "price": price,
+                    "volume": volume,
+                }
+
+        if result:
+            return result
+
+    raise RuntimeError(
+        "Could not retrieve tickers: " + " | ".join(errors)
+    )
+
+
+# ---------------- CANDLES ----------------
+
+def get_candles(symbol, timeframe):
+    # Candle endpoint and response schema must be verified
+    # against the current Bitpin API before live trading.
+    compact = symbol.replace("_", "")
+    interval = "15m" if timeframe == "15m" else "1h"
+
+    urls = [
+        f"{BASE_URL}/v1/mkt/ohlcv/{symbol}/",
+        f"{BASE_URL}/v1/mkt/candles/{symbol}/",
+        f"{BASE_URL}/api/v1/mkt/ohlcv/{symbol}/",
+        f"{BASE_URL}/api/v1/mkt/candles/{symbol}/",
+        f"{BASE_URL}/v1/mkt/ohlcv/{compact}/",
+    ]
+
+    last_error = "No valid candle response"
+
+    for url in urls:
+        for params in (
+            {"interval": interval},
+            {"timeframe": interval},
+            {"resolution": interval},
+        ):
+            data, error = http_json(url, params)
+
+            if data is None:
+                last_error = error or last_error
+                continue
+
+            rows = get_rows(
+                data, ("candles", "ohlcv", "klines", "data", "results")
+            )
+
+            candles = []
+
+            for row in rows:
+                try:
+                    if isinstance(row, dict):
+                        o = as_float(row.get("open", row.get("o")))
+                        h = as_float(row.get("high", row.get("h")))
+                        l = as_float(row.get("low", row.get("l")))
+                        c = as_float(row.get("close", row.get("c")))
+                        v = as_float(
+                            row.get("volume", row.get("v"))
+                        )
+                    elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                        # Expected order: timestamp, open, high,
+                        # low, close, volume
+                        o, h, l, c = map(float, row[1:5])
+                        v = as_float(row[5]) if len(row) > 5 else 0.0
+                    else:
+                        continue
+
+                    if min(o, h, l, c) <= 0:
+                        continue
+
+                    candles.append({
+                        "open": o, "high": h, "low": l,
+                        "close": c, "volume": max(v, 0.0),
+                    })
+                except (TypeError, ValueError, IndexError):
+                    continue
+
+            if len(candles) >= 55:
+                return candles[-100:]
+
+            last_error = (
+                f"Insufficient candles for {symbol} {timeframe}"
+            )
+
+    raise RuntimeError(
+        f"Candle API failed for {symbol} {timeframe}: {last_error}"
+    )
+
+
+# ---------------- INDICATORS ----------------
 
 def ema(values, period):
     if len(values) < period:
@@ -534,7 +407,7 @@ def ema(values, period):
     alpha = 2.0 / (period + 1.0)
 
     for value in values[period:]:
-        result = alpha * value + (1.0 - alpha) * result
+        result = value * alpha + result * (1 - alpha)
 
     return result
 
@@ -548,8 +421,8 @@ def rsi(values, period=14):
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0.0) for x in changes]
-    losses = [max(-x, 0.0) for x in changes]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -565,8 +438,7 @@ def rsi(values, period=14):
     if avg_loss == 0:
         return 100.0
 
-    rs = avg_gain / avg_loss
-    return 100.0 - 100.0 / (1.0 + rs)
+    return 100 - 100 / (1 + avg_gain / avg_loss)
 
 
 def atr(candles, period=14):
@@ -576,176 +448,106 @@ def atr(candles, period=14):
     ranges = []
 
     for i in range(1, len(candles)):
-        current = candles[i]
-        previous_close = candles[i - 1]["close"]
+        cur = candles[i]
+        prev = candles[i - 1]
 
         ranges.append(max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close),
+            cur["high"] - cur["low"],
+            abs(cur["high"] - prev["close"]),
+            abs(cur["low"] - prev["close"]),
         ))
 
-    recent = ranges[-period:]
-    return sum(recent) / len(recent)
+    return sum(ranges[-period:]) / period
 
 
-def analyse_timeframe(candles):
-    if len(candles) < 55:
-        raise ValueError("Not enough candles")
+def analyze(candles):
+    closes = [x["close"] for x in candles]
+    volumes = [x["volume"] for x in candles]
 
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    r = rsi(closes)
+    a = atr(candles)
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    current_rsi = rsi(closes, 14)
-    current_atr = atr(candles, 14)
-
-    if any(x is None for x in (
-        ema20, ema50, current_rsi, current_atr
-    )):
-        raise ValueError("Indicator calculation failed")
-
-    average_volume = (
-        sum(volumes[-21:-1]) / max(len(volumes[-21:-1]), 1)
+    avg_volume = (
+        statistics.mean(volumes[-21:-1])
+        if len(volumes) >= 21 else 0
     )
 
-    current_volume = volumes[-1]
     volume_ratio = (
-        current_volume / average_volume
-        if average_volume > 0 else 0.0
+        volumes[-1] / avg_volume if avg_volume > 0 else 0
     )
 
     return {
-        "close": closes[-1],
-        "previous_close": closes[-2],
-        "ema20": ema20,
-        "ema50": ema50,
-        "rsi": current_rsi,
-        "atr": current_atr,
+        "price": closes[-1],
+        "ema20": e20,
+        "ema50": e50,
+        "rsi": r,
+        "atr": a,
         "volume_ratio": volume_ratio,
     }
 
 
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
+def build_signal(symbol, ticker):
+    c15 = get_candles(symbol, "15m")
+    c1h = get_candles(symbol, "1h")
 
-def build_signal(symbol, ticker, candles15, candles1h):
-    a15 = analyse_timeframe(candles15)
-    a1h = analyse_timeframe(candles1h)
+    a = analyze(c15)
+    b = analyze(c1h)
 
-    price = a15["close"]
+    long_score = 0
+    short_score = 0
 
-    if price <= 0:
+    if b["ema20"] > b["ema50"]:
+        long_score += 25
+    elif b["ema20"] < b["ema50"]:
+        short_score += 25
+
+    if a["ema20"] > a["ema50"]:
+        long_score += 20
+    elif a["ema20"] < a["ema50"]:
+        short_score += 20
+
+    if a["price"] > a["ema20"]:
+        long_score += 10
+    elif a["price"] < a["ema20"]:
+        short_score += 10
+
+    if 50 <= a["rsi"] <= 68:
+        long_score += 15
+    if 32 <= a["rsi"] <= 50:
+        short_score += 15
+
+    if 45 <= b["rsi"] <= 68:
+        long_score += 10
+    if 32 <= b["rsi"] <= 55:
+        short_score += 10
+
+    if a["volume_ratio"] >= 1.15:
+        long_score += 10
+        short_score += 10
+
+    if a["rsi"] >= 75:
+        long_score -= 15
+    if a["rsi"] <= 25:
+        short_score -= 15
+
+    side = "BUY" if long_score >= short_score else "WAIT"
+    score = max(long_score, short_score)
+
+    if side != "BUY" or score < MIN_SCORE:
         return None
 
-    score_long = 0
-    score_short = 0
-    reasons_long = []
-    reasons_short = []
+    price = a["price"]
+    volatility = a["atr"] or price * 0.015
 
-    if a15["ema20"] > a15["ema50"]:
-        score_long += 20
-        reasons_long.append("EMA20 بالاتر از EMA50 در 15m")
-    elif a15["ema20"] < a15["ema50"]:
-        score_short += 20
-        reasons_short.append("EMA20 پایین‌تر از EMA50 در 15m")
+    stop = price - 1.5 * volatility
+    target1 = price + 1.5 * volatility
+    target2 = price + 2.5 * volatility
 
-    if a1h["ema20"] > a1h["ema50"]:
-        score_long += 25
-        reasons_long.append("روند 1h صعودی")
-    elif a1h["ema20"] < a1h["ema50"]:
-        score_short += 25
-        reasons_short.append("روند 1h نزولی")
-
-    rsi15 = a15["rsi"]
-    rsi1h = a1h["rsi"]
-
-    if 50 <= rsi15 <= 68:
-        score_long += 15
-        reasons_long.append("RSI مناسب خرید")
-    elif 32 <= rsi15 < 50:
-        score_short += 15
-        reasons_short.append("RSI مناسب فروش")
-
-    if 45 <= rsi1h <= 70:
-        score_long += 10
-
-    if 30 <= rsi1h <= 55:
-        score_short += 10
-
-    if price > a15["ema20"]:
-        score_long += 10
-    elif price < a15["ema20"]:
-        score_short += 10
-
-    volume_ratio = a15["volume_ratio"]
-
-    if volume_ratio >= 1.15:
-        score_long += 10
-        score_short += 10
-
-    if price > a15["previous_close"]:
-        score_long += 5
-    elif price < a15["previous_close"]:
-        score_short += 5
-
-    quote_volume = get_quote_volume(symbol, ticker)
-
-    if quote_volume and quote_volume < MIN_QUOTE_VOLUME:
-        return None
-
-    difference = abs(score_long - score_short)
-
-    if score_long >= MIN_SCORE and score_long > score_short:
-        side = "LONG"
-        score = score_long
-        reasons = reasons_long
-
-    elif score_short >= MIN_SCORE and score_short > score_long:
-        side = "SHORT"
-        score = score_short
-        reasons = reasons_short
-
-    else:
-        return None
-
-    if difference < 10:
-        return None
-
-    volatility = a15["atr"] / price
-    volatility = max(0.002, min(0.04, volatility))
-
-    stop_pct = max(
-        0.8, min(2.0, volatility * 100.0 * 1.4)
-    )
-
-    target1_pct = stop_pct * 1.2
-    target2_pct = stop_pct * 2.0
-    target3_pct = stop_pct * 3.0
-
-    if side == "LONG":
-        stop = price * (1 - stop_pct / 100)
-        tp1 = price * (1 + target1_pct / 100)
-        tp2 = price * (1 + target2_pct / 100)
-        tp3 = price * (1 + target3_pct / 100)
-    else:
-        stop = price * (1 + stop_pct / 100)
-        tp1 = price * (1 - target1_pct / 100)
-        tp2 = price * (1 - target2_pct / 100)
-        tp3 = price * (1 - target3_pct / 100)
-
-    notional = POSITION_VALUE
-    quantity = notional / price
-
-    def pnl_at(target):
-        move = (
-            (target - price) / price
-            if side == "LONG"
-            else (price - target) / price
-        )
-        return notional * move
+    # Never risk the entire account on one trade.
+    # This is a paper plan, not a guaranteed loss limit.
+    order_value = min(MAX_ORDER_USDT, CAPITAL_USDT * 0.10)
 
     return {
         "symbol": symbol,
@@ -753,250 +555,197 @@ def build_signal(symbol, ticker, candles15, candles1h):
         "score": score,
         "price": price,
         "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "quantity": quantity,
-        "stop_pct": stop_pct,
-        "rsi15": rsi15,
-        "rsi1h": rsi1h,
-        "volume_ratio": volume_ratio,
-        "quote_volume": quote_volume,
-        "pnl1": pnl_at(tp1),
-        "pnl2": pnl_at(tp2),
-        "pnl3": pnl_at(tp3),
-        "reasons": reasons,
+        "tp1": target1,
+        "tp2": target2,
+        "order_value": order_value,
+        "rsi15": a["rsi"],
+        "volume_ratio": a["volume_ratio"],
     }
 
 
-# ============================================================
-# FORMATTING
-# ============================================================
+# ---------------- PAPER TRADING ----------------
 
-def fmt_price(value):
-    if value >= 1000:
-        return f"{value:,.2f}"
-    if value >= 1:
-        return f"{value:.5f}".rstrip("0").rstrip(".")
-    return f"{value:.8f}".rstrip("0").rstrip(".")
-
-
-def fmt_usdt(value):
-    return f"{value:+.2f} USDT"
-
-
-def signal_message(signal):
-    direction = (
-        "🟢 LONG" if signal["side"] == "LONG"
-        else "🔴 SHORT"
-    )
-
-    strength = (
-        "🔥 قوی"
-        if signal["score"] >= STRONG_SCORE
-        else "⚡ متوسط"
-    )
-
-    reasons = "\n".join(
-        "• " + reason for reason in signal["reasons"]
-    )
-
+def paper_message(signal):
     return (
         f"{BOT_NAME}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{signal['symbol']}</b>\n"
-        f"🎯 جهت: <b>{direction}</b>\n"
-        f"⭐ امتیاز: <b>{signal['score']}/100</b> | {strength}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💵 ورود فرضی: <code>{fmt_price(signal['price'])}</code>\n"
-        f"🛑 حد ضرر: <code>{fmt_price(signal['stop'])}</code>\n"
-        f"🥇 TP1: <code>{fmt_price(signal['tp1'])}</code>"
-        f" | P/L: {fmt_usdt(signal['pnl1'])}\n"
-        f"🥈 TP2: <code>{fmt_price(signal['tp2'])}</code>"
-        f" | P/L: {fmt_usdt(signal['pnl2'])}\n"
-        f"🥉 TP3: <code>{fmt_price(signal['tp3'])}</code>"
-        f" | P/L: {fmt_usdt(signal['pnl3'])}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📈 RSI 15m: {signal['rsi15']:.1f}\n"
-        f"📈 RSI 1h: {signal['rsi1h']:.1f}\n"
-        f"📦 نسبت حجم: {signal['volume_ratio']:.2f}x\n"
-        f"💰 مارجین فرضی: {MARGIN_PER_TRADE:.2f} USDT\n"
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x\n"
-        f"📦 ارزش فرضی موقعیت: {POSITION_VALUE:.2f} USDT\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🧠 دلایل سیگنال:\n"
-        f"{reasons}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🧪 <b>PAPER TRADING ONLY</b>\n"
-        "🚫 سفارش واقعی: <b>خاموش</b>\n"
-        "⚠️ کارمزد و لغزش قیمت لحاظ نشده است."
-    )
-
-
-def status_message():
-    now = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
-
-    return (
-        f"{BOT_NAME}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>BITPIN SMART MARKET WATCH</b>\n"
-        "🧪 <b>PAPER SIGNALS ONLY</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT\n"
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x\n"
-        f"💵 مارجین فرضی: {MARGIN_PER_TRADE:.2f} USDT\n"
-        f"📦 ارزش فرضی: {POSITION_VALUE:.2f} USDT\n"
-        f"🎯 حداقل امتیاز: {MIN_SCORE}\n"
-        "📡 تایم‌فریم‌ها: 15m + 1h\n"
-        "📈 شاخص‌ها: EMA20/EMA50 + RSI + Volume + ATR\n"
-        f"🔢 حداکثر بازارها: {MAX_MARKETS}\n"
-        f"🔔 حداکثر سیگنال: {MAX_SIGNALS}\n"
-        "🚫 سفارش واقعی: غیرفعال\n"
-        f"🕒 {now}\n"
+        "🧪 PAPER SPOT SIGNAL\n"
+        f"Market: {signal['symbol']}\n"
+        f"Signal: {signal['side']}\n"
+        f"Score: {signal['score']}/100\n"
+        f"Price: {signal['price']:.8g}\n"
+        f"Virtual order value: {signal['order_value']:.2f} USDT\n"
+        f"Stop reference: {signal['stop']:.8g}\n"
+        f"TP1 reference: {signal['tp1']:.8g}\n"
+        f"TP2 reference: {signal['tp2']:.8g}\n"
+        f"RSI 15m: {signal['rsi15']:.1f}\n"
+        f"Volume ratio: {signal['volume_ratio']:.2f}x\n"
+        "Real order: OFF\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
 
-# ============================================================
-# MARKET SCAN
-# ============================================================
+# ---------------- LIVE TRADING GATE ----------------
 
-def run_scan():
-    if not PAPER_MODE or REAL_ORDERS_ENABLED:
-        raise RuntimeError(
-            "Safety check failed: paper mode must be enabled "
-            "and real orders must remain disabled."
-        )
-
-    started = time.time()
-    errors = 0
-    checked = 0
-    signals = []
-
-    telegram_send(
-        f"{BOT_NAME}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🔄 <b>شروع بررسی بازار بیت‌پین</b>\n"
-        "🧪 حالت آزمایشی؛ بدون سفارش واقعی"
+def live_is_approved():
+    return (
+        LIVE_TRADING
+        and LIVE_CONFIRMATION == REQUIRED_CONFIRMATION
+        and bool(API_KEY)
+        and bool(API_SECRET)
     )
 
-    markets = get_markets()
-    tickers = get_tickers()
 
-    for index, market in enumerate(markets, start=1):
-        symbol = market["symbol"]
-        ticker = ticker_for(symbol, tickers)
+def place_live_order(signal):
+    """
+    Deliberately fail closed.
 
+    Before enabling live orders, the current Bitpin API must be
+    verified for:
+      - authentication and permissions
+      - spot market ID and market precision
+      - available USDT balance
+      - minimum order value and amount
+      - current ask price / slippage
+      - duplicate-order protection
+      - order status verification
+
+    The bot does not submit an order until this function is
+    connected to a verified and tested Bitpin SDK integration.
+    """
+    if not live_is_approved():
+        return {
+            "ok": False,
+            "reason": "Live trading is not approved",
+        }
+
+    # No guessed endpoint, market ID, or order payload.
+    # Safe default: refuse to place a real order.
+    return {
+        "ok": False,
+        "reason": (
+            "LIVE ORDER BLOCKED: Bitpin market metadata, "
+            "balance, precision and order flow must be verified "
+            "before real execution is enabled."
+        ),
+    }
+
+
+# ---------------- MAIN SCAN ----------------
+
+def main():
+    mode = "LIVE REQUESTED" if LIVE_TRADING else "PAPER ONLY"
+
+    startup = (
+        f"{BOT_NAME}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "BITPIN SPOT MARKET WATCH\n"
+        f"Mode: {mode}\n"
+        f"Capital reference: {CAPITAL_USDT:.2f} USDT\n"
+        f"Maximum order: {MAX_ORDER_USDT:.2f} USDT\n"
+        "Leverage: OFF\n"
+        "Withdrawals: NOT USED\n"
+        f"Time: {utc_now().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    notify(startup)
+
+    try:
+        markets = get_markets()
+        tickers = get_tickers()
+
+        candidates = [
+            symbol for symbol in markets
+            if symbol in tickers and tickers[symbol]["price"] > 0
+        ]
+
+        # Prioritize higher quote volume when the API provides it.
+        candidates.sort(
+            key=lambda s: tickers[s]["volume"],
+            reverse=True,
+        )
+        candidates = candidates[:MAX_MARKETS]
+
+        logging.info(
+            "Markets=%d | tickers=%d | scanning=%d",
+            len(markets), len(tickers), len(candidates),
+        )
+
+    except Exception as exc:
+        notify(
+            f"{BOT_NAME}\n"
+            "❌ SCAN FAILED\n"
+            f"Reason: {exc}\n"
+            "Real orders: OFF"
+        )
+        raise
+
+    signals = []
+    errors = 0
+
+    for symbol in candidates:
         try:
-            quote_volume = get_quote_volume(symbol, ticker)
-
-            if quote_volume and quote_volume < MIN_QUOTE_VOLUME:
-                continue
-
-            candles15 = get_candles(symbol, "15m")
-            candles1h = get_candles(symbol, "1h")
-
-            checked += 1
-
-            signal = build_signal(
-                symbol, ticker, candles15, candles1h
-            )
+            signal = build_signal(symbol, tickers[symbol])
 
             if signal:
                 signals.append(signal)
 
-            if index % 20 == 0:
-                logging.info(
-                    "Scan progress: %d/%d markets",
-                    index, len(markets),
-                )
-
         except Exception as exc:
             errors += 1
-            logging.warning("Skipped %s: %s", symbol, exc)
+            logging.warning(
+                "Skipped %s: %s", symbol, exc
+            )
+
+        # Respect the API and reduce rate-limit risk.
+        time.sleep(0.2)
 
     signals.sort(
-        key=lambda item: item["score"],
+        key=lambda x: x["score"],
         reverse=True,
     )
+    signals = signals[:MAX_DAILY_ORDERS]
 
-    selected = signals[:MAX_SIGNALS]
-    elapsed = time.time() - started
-    sent = 0
-
-    for signal in selected:
-        if telegram_send(signal_message(signal)):
-            sent += 1
-        time.sleep(0.4)
-
-    summary = (
-        f"{BOT_NAME}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>گزارش پایان اسکن</b>\n"
-        f"🔎 بازارهای تحلیل‌شده: {checked}\n"
-        f"📡 بازارهای دریافت‌شده: {len(markets)}\n"
-        f"🎯 سیگنال‌های واجد شرایط: {len(signals)}\n"
-        f"📨 پیام‌های سیگنال ارسال‌شده: {sent}\n"
-        f"⚠️ بازارهای دارای خطا: {errors}\n"
-        f"⏱ مدت اجرا: {elapsed:.1f} ثانیه\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT\n"
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x\n"
-        "🧪 PAPER ONLY | 🚫 REAL ORDERS OFF"
-    )
-
-    telegram_send(summary)
-
-    logging.info(
-        "Scan completed: markets=%d checked=%d "
-        "signals=%d errors=%d duration=%.1fs",
-        len(markets), checked, len(selected), errors, elapsed,
-    )
-
-    if checked == 0:
-        raise RuntimeError(
-            "No market completed candle analysis. "
-            "Check Bitpin candle API and logs."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    logging.info("ETH WHALE Bitpin paper bot starting.")
-    logging.info(
-        "Paper mode=%s | Real orders=%s",
-        PAPER_MODE, REAL_ORDERS_ENABLED,
-    )
-
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning(
-            "Telegram credentials missing. Check GitHub Secrets."
-        )
-
-    telegram_send(status_message())
-
-    try:
-        run_scan()
-
-    except Exception as exc:
-        logging.exception("Scan failed")
-
-        telegram_send(
+    if not signals:
+        notify(
             f"{BOT_NAME}\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "❌ <b>اسکن کامل نشد</b>\n"
-            f"علت: <code>{str(exc)[:700]}</code>\n"
-            "🧪 حالت آزمایشی فعال است.\n"
-            "🚫 هیچ سفارش واقعی ثبت نشده است."
+            "📊 SCAN COMPLETED\n"
+            f"Markets scanned: {len(candidates)}\n"
+            f"Data errors: {errors}\n"
+            "No signal passed the filter.\n"
+            "🧪 Paper mode active\n"
+            "🚫 No real order submitted"
         )
+        return
 
-        raise
+    for signal in signals:
+        if live_is_approved():
+            result = place_live_order(signal)
+
+            notify(
+                paper_message(signal)
+                + "\n\nLIVE EXECUTION RESULT:\n"
+                + json.dumps(result, ensure_ascii=False)
+            )
+        else:
+            notify(paper_message(signal))
+
+    notify(
+        f"{BOT_NAME}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "✅ SCAN COMPLETED\n"
+        f"Signals: {len(signals)}\n"
+        f"Markets scanned: {len(candidates)}\n"
+        f"Data errors: {errors}\n"
+        "Real order execution: BLOCKED\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logging.exception("Fatal bot error")
+        sys.exit(1)
