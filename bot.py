@@ -1,11 +1,4 @@
 
-# -*- coding: utf-8 -*-
-"""
-ETH WHALE V5.2
-Paper signals only. No real orders.
-Kraken public market data.
-"""
-
 import os
 import json
 import time
@@ -13,38 +6,34 @@ import logging
 from datetime import datetime, timezone
 
 import requests
+import pandas as pd
 
-BOT_NAME = "🐋 ETH WHALE V5.2"
-API_URL = "https://api.kraken.com/0/public/OHLC"
+# ============================================================
+# ETH WHALE V5.3
+# Kraken public market data | Paper trading only
+# NO REAL ORDERS | NO PRIVATE EXCHANGE API
+# ============================================================
+
+BOT_NAME = "🐋 ETH WHALE V5.3"
+BASE_URL = "https://api.kraken.com/0/public"
 HISTORY_FILE = "paper_history.json"
 
-TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    or os.getenv("TELEGRAM_TOKEN", "").strip()
-)
-CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    or os.getenv("CHAT_ID", "").strip()
-)
-
 CAPITAL = 48.0
-LEVERAGE = 3
-MARGIN = 16.0
-MAX_OPEN = 3
+LEVERAGE = 3.0
+MARGIN_PER_TRADE = 16.0
+NOTIONAL_PER_TRADE = MARGIN_PER_TRADE * LEVERAGE
+
 MAX_SIGNALS = 3
+MAX_OPEN_TRADES = 3
+MIN_TREND_STRENGTH = 55
+MIN_SIGNAL_SCORE = 60
 
-MIN_TREND = 55
-MIN_SCORE = 55
-ATR_MULT = 1.25
-MIN_OBSTACLE_PCT = 0.30
-
-# Approximate round-trip cost assumption, not a Kraken fee quote.
-# Change this to match the actual fee and slippage assumption.
-ROUND_TRIP_COST_PCT = 0.20
-
-MIN_BACKTEST_TRADES = 20
+ATR_MULTIPLIER = 1.3
+TARGET_R = 1.0
 BACKTEST_HORIZON = 12
-BACKTEST_TP_R = 1.0
+ROUND_TRIP_COST_PCT = 0.20
+SLIPPAGE_PCT = 0.05
+MIN_BACKTEST_TRADES = 20
 
 MARKETS = [
     ("BTC", "XBTUSD"),
@@ -59,42 +48,346 @@ MARKETS = [
     ("BCH", "BCHUSD"),
 ]
 
+TIMEFRAMES = {
+    "15m": 15,
+    "1h": 60,
+    "4h": 240,
+}
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
-S = requests.Session()
-S.headers.update({"User-Agent": "ETH-WHALE-PaperBot/5.2"})
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "ETH-WHALE-PaperBot/5.3"})
 
 
-def now_text():
+def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def send_telegram(text):
-    if not TOKEN or not CHAT_ID:
-        print(text)
+def telegram_send(message):
+    token = (
+        os.getenv("TELEGRAM_BOT_TOKEN")
+        or os.getenv("TELEGRAM_TOKEN")
+    )
+    chat_id = (
+        os.getenv("TELEGRAM_CHAT_ID")
+        or os.getenv("CHAT_ID")
+    )
+
+    if not token or not chat_id:
         logging.warning("Telegram credentials are missing.")
-        return
+        print(message)
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
-        response = S.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        response = SESSION.post(
+            url,
             json={
-                "chat_id": CHAT_ID,
-                "text": text,
+                "chat_id": chat_id,
+                "text": message,
                 "disable_web_page_preview": True,
             },
-            timeout=20,
+            timeout=15,
         )
         response.raise_for_status()
+        data = response.json()
 
-        if not response.json().get("ok"):
-            logging.error("Telegram did not accept the message.")
+        if not data.get("ok"):
+            logging.error("Telegram API returned ok=false.")
+            return False
+
+        return True
 
     except Exception as exc:
-        logging.error("Telegram error: %s", exc)
+        logging.error("Telegram send failed: %s", exc)
+        print(message)
+        return False
+
+
+def fetch_ohlc(pair, interval, retries=3):
+    """Fetch public OHLC data. Kraken normally limits recent history."""
+    last_error = "unknown error"
+
+    for attempt in range(retries):
+        try:
+            response = SESSION.get(
+                f"{BASE_URL}/OHLC",
+                params={"pair": pair, "interval": interval},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            errors = payload.get("error", [])
+            if errors:
+                raise RuntimeError("; ".join(errors))
+
+            result = payload.get("result", {})
+            keys = [key for key in result.keys() if key != "last"]
+
+            if not keys:
+                raise RuntimeError("No OHLC data returned")
+
+            rows = result[keys[0]]
+            if not rows or len(rows) < 80:
+                raise RuntimeError(
+                    f"Insufficient candles: {len(rows) if rows else 0}"
+                )
+
+            df = pd.DataFrame(
+                rows,
+                columns=[
+                    "time", "open", "high", "low", "close",
+                    "vwap", "volume", "count"
+                ],
+            )
+
+            for col in [
+                "time", "open", "high", "low",
+                "close", "volume", "count"
+            ]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna().drop_duplicates("time")
+            df = df.sort_values("time").reset_index(drop=True)
+
+            # The final OHLC candle can still be forming.
+            # Exclude it to avoid using incomplete candle data.
+            if len(df) > 2:
+                df = df.iloc[:-1].reset_index(drop=True)
+
+            if len(df) < 80:
+                raise RuntimeError("Not enough closed candles")
+
+            return df
+
+        except Exception as exc:
+            last_error = str(exc)
+            logging.warning(
+                "OHLC %s/%s attempt %s failed: %s",
+                pair, interval, attempt + 1, exc
+            )
+            time.sleep(1.2 * (attempt + 1))
+
+    raise RuntimeError(last_error)
+
+
+def add_indicators(df):
+    df = df.copy()
+
+    df["ema20"] = df["close"].ewm(
+        span=20, adjust=False
+    ).mean()
+    df["ema50"] = df["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / 14, adjust=False, min_periods=14
+    ).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / 14, adjust=False, min_periods=14
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
+
+    previous_close = df["close"].shift(1)
+
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - previous_close).abs()
+    tr3 = (df["low"] - previous_close).abs()
+
+    df["tr"] = pd.concat(
+        [tr1, tr2, tr3], axis=1
+    ).max(axis=1)
+
+    df["atr"] = df["tr"].ewm(
+        alpha=1 / 14, adjust=False, min_periods=14
+    ).mean()
+
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_ratio"] = (
+        df["volume"] / df["vol_ma20"].replace(0, float("nan"))
+    ).fillna(1.0)
+
+    return df
+
+
+def trend_direction(row):
+    if row["ema20"] > row["ema50"]:
+        return "LONG"
+    if row["ema20"] < row["ema50"]:
+        return "SHORT"
+    return "WAIT"
+
+
+def detect_breakout_retest(df, lookback=20):
+    """
+    Detect a prior breakout followed by a retest.
+    Levels are calculated only from candles before the breakout.
+    """
+    if len(df) < lookback + 10:
+        return None
+
+    current = df.iloc[-1]
+    recent = df.iloc[-7:-1]
+
+    # Search for a breakout 1-6 closed candles before the current candle.
+    for j in range(len(df) - 2, max(lookback, len(df) - 8), -1):
+        prior = df.iloc[j - lookback:j]
+        breakout = df.iloc[j]
+
+        resistance = float(prior["high"].max())
+        support = float(prior["low"].min())
+        atr = float(breakout["atr"])
+
+        if not pd.notna(atr) or atr <= 0:
+            continue
+
+        # A bullish breakout must close above the prior resistance.
+        if breakout["close"] > resistance:
+            # Current candle retests the old level and closes back above it.
+            tolerance = max(atr * 0.30, breakout["close"] * 0.0005)
+            retest = (
+                current["low"] <= resistance + tolerance
+                and current["close"] > resistance
+            )
+            if retest:
+                return {
+                    "side": "LONG",
+                    "level": resistance,
+                    "atr": float(current["atr"]),
+                }
+
+        # A bearish breakout must close below the prior support.
+        if breakout["close"] < support:
+            tolerance = max(atr * 0.30, breakout["close"] * 0.0005)
+            retest = (
+                current["high"] >= support - tolerance
+                and current["close"] < support
+            )
+            if retest:
+                return {
+                    "side": "SHORT",
+                    "level": support,
+                    "atr": float(current["atr"]),
+                }
+
+    return None
+
+
+def analyze_market(symbol, pair, frames):
+    df15 = add_indicators(frames["15m"])
+    df1h = add_indicators(frames["1h"])
+    df4h = add_indicators(frames["4h"])
+
+    r15 = df15.iloc[-1]
+    r1h = df1h.iloc[-1]
+    r4h = df4h.iloc[-1]
+
+    trend15 = trend_direction(r15)
+    trend1h = trend_direction(r1h)
+    trend4h = trend_direction(r4h)
+
+    breakout = detect_breakout_retest(df15)
+    if breakout is None:
+        return None, "شکست و پولبک معتبر پیدا نشد"
+
+    side = breakout["side"]
+
+    if trend1h != side:
+        return None, "عدم تأیید روند یک‌ساعته"
+
+    if trend4h not in (side, "WAIT"):
+        return None, "تعارض روند چهار‌ساعته"
+
+    price = float(r15["close"])
+    atr = float(r15["atr"])
+    rsi = float(r15["rsi"])
+    volume_ratio = float(r15["vol_ratio"])
+
+    if price <= 0 or atr <= 0:
+        return None, "داده اندیکاتور نامعتبر"
+
+    # Balanced scoring; this is a technical score, not win probability.
+    score = 0
+    score += 25 if trend1h == side else 0
+    score += 20 if trend15 == side else 0
+    score += 10 if trend4h == side else 0
+
+    if side == "LONG":
+        score += 15 if 50 <= rsi <= 70 else 0
+        score += 10 if rsi < 78 else 0
+    else:
+        score += 15 if 30 <= rsi <= 50 else 0
+        score += 10 if rsi > 22 else 0
+
+    score += 10 if volume_ratio >= 1.10 else 0
+    score += 10 if abs(price - breakout["level"]) <= atr * 0.60 else 0
+
+    trend_strength = min(
+        100,
+        (25 if trend1h == side else 0)
+        + (25 if trend15 == side else 0)
+        + (20 if trend4h == side else 0)
+        + (15 if abs(float(r1h["ema20"] - r1h["ema50"])) / price > 0.001 else 0)
+        + (15 if volume_ratio >= 1.10 else 0),
+    )
+
+    if trend_strength < MIN_TREND_STRENGTH:
+        return None, f"قدرت روند {trend_strength}/100"
+
+    if score < MIN_SIGNAL_SCORE:
+        return None, f"امتیاز سیگنال {score}/100"
+
+    # Avoid chasing a move if price is too far from the retest level.
+    distance_pct = abs(price - breakout["level"]) / price * 100
+    if distance_pct > 0.45:
+        return None, "قیمت بیش از حد از سطح پولبک فاصله دارد"
+
+    stop_distance = atr * ATR_MULTIPLIER
+    if stop_distance <= 0:
+        return None, "فاصله حد ضرر نامعتبر"
+
+    if side == "LONG":
+        entry = price
+        stop = entry - stop_distance
+        target = entry + stop_distance * TARGET_R
+    else:
+        entry = price
+        stop = entry + stop_distance
+        target = entry - stop_distance * TARGET_R
+
+    return {
+        "symbol": symbol,
+        "pair": pair,
+        "side": side,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "score": int(score),
+        "trend_strength": int(trend_strength),
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "atr": atr,
+        "level": float(breakout["level"]),
+        "signal_time": int(r15["time"]),
+        "time": utc_now(),
+        "status": "OPEN",
+        "margin": MARGIN_PER_TRADE,
+        "notional": NOTIONAL_PER_TRADE,
+    }, None
 
 
 def load_history():
@@ -107,800 +400,466 @@ def load_history():
 
         if not isinstance(data, dict):
             return {"trades": []}
+        if not isinstance(data.get("trades"), list):
+            data["trades"] = []
 
-        data.setdefault("trades", [])
         return data
 
     except Exception as exc:
-        logging.error("History load failed: %s", exc)
+        logging.warning("Could not read history: %s", exc)
         return {"trades": []}
 
 
 def save_history(history):
-    tmp = HISTORY_FILE + ".tmp"
+    temp_file = HISTORY_FILE + ".tmp"
 
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
-    os.replace(tmp, HISTORY_FILE)
+    os.replace(temp_file, HISTORY_FILE)
 
 
-def fetch_candles(pair, interval, limit=200):
-    response = S.get(
-        API_URL,
-        params={"pair": pair, "interval": interval},
-        timeout=20,
-    )
-    response.raise_for_status()
-    data = response.json()
+def signal_id(signal):
+    return f'{signal["pair"]}-{signal["side"]}-{signal["signal_time"]}'
 
-    if data.get("error"):
-        raise RuntimeError("; ".join(data["error"]))
 
-    result = data.get("result", {})
-    keys = [k for k in result if k != "last"]
+def add_paper_trade(history, signal):
+    sid = signal_id(signal)
 
-    if not keys:
-        raise RuntimeError("Kraken returned no candles.")
+    if any(t.get("id") == sid for t in history["trades"]):
+        return False
 
-    candles = []
-    interval_seconds = interval * 60
-    now = int(time.time())
-
-    for row in result[keys[0]][-limit:]:
-        if len(row) < 7:
-            continue
-
-        candle = {
-            "time": int(row[0]),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[6]),
-        }
-
-        # Only closed candles.
-        if candle["time"] + interval_seconds <= now:
-            candles.append(candle)
-
-    if len(candles) < 60:
-        raise RuntimeError(
-            f"Insufficient closed candles: {len(candles)}"
-        )
-
-    return candles
-
-
-def ema(values, period):
-    out = [None] * len(values)
-
-    if len(values) < period:
-        return out
-
-    current = sum(values[:period]) / period
-    out[period - 1] = current
-    alpha = 2.0 / (period + 1)
-
-    for i in range(period, len(values)):
-        current = values[i] * alpha + current * (1 - alpha)
-        out[i] = current
-
-    return out
-
-
-def rsi(values, period=14):
-    out = [None] * len(values)
-
-    if len(values) <= period:
-        return out
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    def value(gain, loss):
-        if loss == 0:
-            return 100.0 if gain > 0 else 50.0
-        return 100 - 100 / (1 + gain / loss)
-
-    out[period] = value(avg_gain, avg_loss)
-
-    for i in range(period + 1, len(values)):
-        change = values[i] - values[i - 1]
-        avg_gain = (
-            avg_gain * (period - 1) + max(change, 0)
-        ) / period
-        avg_loss = (
-            avg_loss * (period - 1) + max(-change, 0)
-        ) / period
-        out[i] = value(avg_gain, avg_loss)
-
-    return out
-
-
-def atr(candles, period=14):
-    out = [None] * len(candles)
-    tr = []
-
-    for i, c in enumerate(candles):
-        if i == 0:
-            tr.append(c["high"] - c["low"])
-        else:
-            previous = candles[i - 1]["close"]
-            tr.append(max(
-                c["high"] - c["low"],
-                abs(c["high"] - previous),
-                abs(c["low"] - previous),
-            ))
-
-    if len(candles) <= period:
-        return out
-
-    current = sum(tr[1:period + 1]) / period
-    out[period] = current
-
-    for i in range(period + 1, len(candles)):
-        current = (current * (period - 1) + tr[i]) / period
-        out[i] = current
-
-    return out
-
-
-def indicators(candles):
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
-
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    rv = rsi(closes)
-    av = atr(candles)
-
-    avg_volume = (
-        sum(volumes[-21:-1]) / len(volumes[-21:-1])
-        if len(volumes) >= 21 else 0
-    )
-
-    return {
-        "close": closes[-1],
-        "ema20": e20[-1],
-        "ema50": e50[-1],
-        "rsi": rv[-1],
-        "atr": av[-1],
-        "volume_ratio": (
-            volumes[-1] / avg_volume if avg_volume > 0 else 0
-        ),
-        "candle": candles[-1],
-    }
-
-
-def direction(ind):
-    if ind["ema20"] is None or ind["ema50"] is None:
-        return "WAIT"
-
-    if ind["ema20"] > ind["ema50"] and ind["close"] > ind["ema20"]:
-        return "LONG"
-
-    if ind["ema20"] < ind["ema50"] and ind["close"] < ind["ema20"]:
-        return "SHORT"
-
-    return "WAIT"
-
-
-def trend_score(m15, h1, h4, side):
-    score = 0
-    reasons = []
-
-    if direction(h1) == side:
-        score += 30
-        reasons.append("تأیید روند ۱ساعته")
-
-    if direction(m15) == side:
-        score += 25
-        reasons.append("تأیید روند ۱۵دقیقه")
-
-    r = h1["rsi"]
-
-    if r is not None:
-        if side == "LONG" and 45 <= r <= 68:
-            score += 15
-            reasons.append("RSI مناسب خرید")
-        elif side == "SHORT" and 32 <= r <= 55:
-            score += 15
-            reasons.append("RSI مناسب فروش")
-
-    if h1["volume_ratio"] >= 1.05:
-        score += 15
-        reasons.append("حجم تأییدکننده")
-
-    candle = h1["candle"]
-
-    if side == "LONG" and candle["close"] > candle["open"]:
-        score += 15
-        reasons.append("کندل صعودی بسته‌شده")
-    elif side == "SHORT" and candle["close"] < candle["open"]:
-        score += 15
-        reasons.append("کندل نزولی بسته‌شده")
-
-    if direction(h4) == side:
-        score += 5
-        reasons.append("هم‌جهتی ۴ساعته")
-
-    return min(score, 100), reasons
-
-
-def obstacle_check(candles, price, side):
-    recent = candles[-40:]
-
-    if side == "LONG":
-        levels = [c["high"] for c in recent if c["high"] > price]
-        if levels:
-            distance = (min(levels) - price) / price * 100
-            if distance < MIN_OBSTACLE_PCT:
-                return f"مقاومت نزدیک: {distance:.2f}%"
-
-    else:
-        levels = [c["low"] for c in recent if c["low"] < price]
-        if levels:
-            distance = (price - max(levels)) / price * 100
-            if distance < MIN_OBSTACLE_PCT:
-                return f"حمایت نزدیک: {distance:.2f}%"
-
-    return None
-
-
-def analyze(market):
-    name, pair = market
-
-    c15 = fetch_candles(pair, 15, 200)
-    time.sleep(0.2)
-    c1 = fetch_candles(pair, 60, 200)
-    time.sleep(0.2)
-    c4 = fetch_candles(pair, 240, 100)
-
-    m15, h1, h4 = indicators(c15), indicators(c1), indicators(c4)
-    side = direction(h1)
-
-    if side == "WAIT":
-        return None, "عدم تأیید روند یک‌ساعته"
-
-    score, reasons = trend_score(m15, h1, h4, side)
-
-    if score < MIN_TREND:
-        return None, f"قدرت روند {score}/100"
-
-    price = h1["close"]
-    av = h1["atr"]
-    rv = h1["rsi"]
-
-    if not av or av <= 0 or rv is None:
-        return None, "ATR یا RSI نامعتبر"
-
-    if side == "LONG" and not 40 <= rv <= 70:
-        return None, "RSI خارج از محدوده خرید"
-
-    if side == "SHORT" and not 30 <= rv <= 60:
-        return None, "RSI خارج از محدوده فروش"
-
-    obstacle = obstacle_check(c1, price, side)
-    if obstacle:
-        return None, obstacle
-
-    stop_distance = ATR_MULT * av
-
-    if side == "LONG":
-        stop = price - stop_distance
-        targets = [
-            price + stop_distance * 1.0,
-            price + stop_distance * 1.6,
-            price + stop_distance * 2.2,
-        ]
-    else:
-        stop = price + stop_distance
-        targets = [
-            price - stop_distance * 1.0,
-            price - stop_distance * 1.6,
-            price - stop_distance * 2.2,
-        ]
-
-    volume_score = min(100, int(h1["volume_ratio"] * 50))
-    signal_score = int(score * 0.75 + volume_score * 0.25)
-
-    if signal_score < MIN_SCORE:
-        return None, f"امتیاز سیگنال {signal_score}/100"
-
-    return {
-        "id": f"{name}-{c1[-1]['time']}-{side}",
-        "symbol": name,
-        "pair": pair,
-        "direction": side,
-        "entry": price,
-        "stop": stop,
-        "tp1": targets[0],
-        "tp2": targets[1],
-        "tp3": targets[2],
-        "trend_score": score,
-        "signal_score": signal_score,
-        "rsi": rv,
-        "volume_ratio": h1["volume_ratio"],
-        "reasons": reasons,
-        "candle_time": c1[-1]["time"],
-        "margin": MARGIN,
-        "position_value": MARGIN * LEVERAGE,
-    }, "سیگنال معتبر"
-
-
-# ------------------------------------------------------------
-# Historical test: simple 1h EMA/RSI backtest.
-# Assumes TP1 = 1R and conservative stop-first handling.
-# ------------------------------------------------------------
-
-def historical_backtest(candles):
-    closes = [c["close"] for c in candles]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    rv = rsi(closes)
-    av = atr(candles)
-
-    results = []
-    i = 50
-
-    while i < len(candles) - BACKTEST_HORIZON:
-        price = closes[i]
-
-        if None in (e20[i], e50[i], rv[i], av[i]) or av[i] <= 0:
-            i += 1
-            continue
-
-        side = "WAIT"
-
-        if e20[i] > e50[i] and price > e20[i] and 40 <= rv[i] <= 68:
-            side = "LONG"
-        elif e20[i] < e50[i] and price < e20[i] and 32 <= rv[i] <= 60:
-            side = "SHORT"
-
-        if side == "WAIT":
-            i += 1
-            continue
-
-        risk = ATR_MULT * av[i]
-        target_r = BACKTEST_TP_R
-        outcome = None
-
-        for j in range(i + 1, min(i + BACKTEST_HORIZON + 1, len(candles))):
-            c = candles[j]
-
-            if side == "LONG":
-                stop_hit = c["low"] <= price - risk
-                target_hit = c["high"] >= price + risk * target_r
-            else:
-                stop_hit = c["high"] >= price + risk
-                target_hit = c["low"] <= price - risk * target_r
-
-            if stop_hit:
-                outcome = -1.0
-                break
-
-            if target_hit:
-                outcome = target_r
-                break
-
-        if outcome is not None:
-            # Approximate round-trip cost converted to R.
-            fee_r = (
-                ROUND_TRIP_COST_PCT / 100 * price / risk
-            )
-            results.append(outcome - fee_r)
-            i += BACKTEST_HORIZON
-        else:
-            i += 1
-
-    if not results:
-        return {"trades": 0, "wins": 0, "losses": 0,
-                "win_rate": None, "expectancy_r": None,
-                "profit_factor": None, "max_dd_r": None}
-
-    wins = sum(1 for x in results if x > 0)
-    losses = len(results) - wins
-    positive = sum(x for x in results if x > 0)
-    negative = abs(sum(x for x in results if x < 0))
-
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-
-    for value in results:
-        equity += value
-        peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
-
-    return {
-        "trades": len(results),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": wins / len(results) * 100,
-        "expectancy_r": sum(results) / len(results),
-        "profit_factor": positive / negative if negative else None,
-        "max_dd_r": max_dd,
-    }
-
-
-def run_backtests():
-    combined = []
-
-    for name, pair in MARKETS:
-        try:
-            candles = fetch_candles(pair, 60, 700)
-            result = historical_backtest(candles)
-            # Combine individual market results by using each
-            # completed trade's aggregate metrics as a weighted
-            # approximation only. Do not fabricate trade records.
-            combined.append(result)
-        except Exception as exc:
-            logging.warning("Backtest %s failed: %s", name, exc)
-
-        time.sleep(0.2)
-
-    total_trades = sum(x["trades"] for x in combined)
-    total_wins = sum(x["wins"] for x in combined)
-    total_losses = sum(x["losses"] for x in combined)
-
-    # These metrics are weighted/aggregated from per-market tests.
-    weighted_expectancy = None
-    if total_trades:
-        weighted_expectancy = sum(
-            x["expectancy_r"] * x["trades"]
-            for x in combined if x["expectancy_r"] is not None
-        ) / total_trades
-
-    pf_values = [
-        x["profit_factor"] for x in combined
-        if x["profit_factor"] is not None
+    open_trades = [
+        t for t in history["trades"]
+        if t.get("status") == "OPEN"
     ]
 
-    return {
-        "trades": total_trades,
-        "wins": total_wins,
-        "losses": total_losses,
-        "win_rate": (
-            total_wins / total_trades * 100
-            if total_trades else None
-        ),
-        "expectancy_r": weighted_expectancy,
-        "profit_factor": (
-            sum(pf_values) / len(pf_values) if pf_values else None
-        ),
-        "max_dd_r": max(
-            (x["max_dd_r"] or 0 for x in combined),
-            default=0,
-        ),
-    }
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        return False
+
+    if any(t.get("pair") == signal["pair"] for t in open_trades):
+        return False
+
+    trade = dict(signal)
+    trade["id"] = sid
+    trade["opened_at"] = utc_now()
+    trade["closed_at"] = None
+    trade["exit_price"] = None
+    trade["pnl_usdt"] = None
+    trade["exit_reason"] = None
+
+    history["trades"].append(trade)
+    return True
 
 
-# ------------------------------------------------------------
-# Paper tracking
-# Each paper trade exits at its first target or stop.
-# This keeps closed-trade statistics easy to interpret.
-# ------------------------------------------------------------
-
-def close_trade(trade, price, result):
-    entry = trade["entry"]
-    notional = trade["position_value"]
-
-    if trade["direction"] == "LONG":
-        gross = (price - entry) / entry * notional
-    else:
-        gross = (entry - price) / entry * notional
-
-    estimated_cost = notional * ROUND_TRIP_COST_PCT / 100
-
-    trade["status"] = "CLOSED"
-    trade["result"] = result
-    trade["exit_price"] = price
-    trade["pnl_usdt"] = round(gross - estimated_cost, 4)
-    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
-
-
-def update_paper(history):
+def update_open_trades(history, latest_frames):
+    """
+    Paper-only exit monitoring.
+    If both stop and target fall inside the same candle, assume the stop
+    was hit first (conservative handling).
+    """
     changed = False
-    pairs = {name: pair for name, pair in MARKETS}
 
     for trade in history["trades"]:
         if trade.get("status") != "OPEN":
             continue
 
-        try:
-            candles = fetch_candles(pairs[trade["symbol"]], 60, 100)
+        symbol = trade.get("symbol")
+        pair = trade.get("pair")
 
-            for c in candles:
-                if c["time"] <= int(trade["last_checked"]):
-                    continue
+        if symbol not in latest_frames:
+            continue
 
-                if trade["direction"] == "LONG":
-                    stop_hit = c["low"] <= trade["stop"]
-                    tp_hit = c["high"] >= trade["tp1"]
-                else:
-                    stop_hit = c["high"] >= trade["stop"]
-                    tp_hit = c["low"] <= trade["tp1"]
+        df = latest_frames[symbol].get("15m")
+        if df is None or df.empty:
+            continue
 
-                # Conservative if stop and target are hit in same candle.
+        # Only candles later than the signal candle are eligible.
+        candles = df[df["time"] > float(trade["signal_time"])]
+        if candles.empty:
+            continue
+
+        side = trade["side"]
+        entry = float(trade["entry"])
+        stop = float(trade["stop"])
+        target = float(trade["target"])
+        notional = float(trade["notional"])
+        qty = notional / entry
+
+        exit_price = None
+        exit_reason = None
+
+        for _, candle in candles.iterrows():
+            high = float(candle["high"])
+            low = float(candle["low"])
+
+            if side == "LONG":
+                stop_hit = low <= stop
+                target_hit = high >= target
+
                 if stop_hit:
-                    close_trade(trade, trade["stop"], "LOSS")
-                    changed = True
+                    exit_price = stop
+                    exit_reason = "SL"
+                    break
+                if target_hit:
+                    exit_price = target
+                    exit_reason = "TP1"
                     break
 
-                if tp_hit:
-                    close_trade(trade, trade["tp1"], "WIN")
-                    changed = True
+            else:
+                stop_hit = high >= stop
+                target_hit = low <= target
+
+                if stop_hit:
+                    exit_price = stop
+                    exit_reason = "SL"
+                    break
+                if target_hit:
+                    exit_price = target
+                    exit_reason = "TP1"
                     break
 
-                trade["last_checked"] = c["time"]
-                changed = True
+        if exit_price is None:
+            continue
 
-        except Exception as exc:
-            logging.warning("Paper update %s: %s", trade["symbol"], exc)
+        gross = (
+            (exit_price - entry) * qty
+            if side == "LONG"
+            else (entry - exit_price) * qty
+        )
 
-        time.sleep(0.2)
+        # Approximate round-trip fee plus slippage assumption.
+        cost = notional * (
+            ROUND_TRIP_COST_PCT + SLIPPAGE_PCT
+        ) / 100.0
 
-    if changed:
-        save_history(history)
+        net = gross - cost
 
+        trade["status"] = "CLOSED"
+        trade["closed_at"] = utc_now()
+        trade["exit_price"] = exit_price
+        trade["exit_reason"] = exit_reason
+        trade["pnl_usdt"] = round(net, 4)
+        changed = True
 
-def register_paper_trade(signal, history):
-    trades = history["trades"]
+        telegram_send(
+            f"{BOT_NAME}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📕 بسته‌شدن معامله آزمایشی\n"
+            f"بازار: {symbol}\n"
+            f"جهت: {side}\n"
+            f"علت خروج: {exit_reason}\n"
+            f"ورود: {entry:.8g}\n"
+            f"خروج: {exit_price:.8g}\n"
+            f"سود/زیان خالص فرضی: {net:+.4f} USDT\n"
+            "🧪 Paper trading — سفارش واقعی ثبت نشده است."
+        )
 
-    # Prevent the same signal from being registered repeatedly,
-    # even if the previous trade has already closed.
-    if any(t.get("id") == signal["id"] for t in trades):
-        return False
-
-    opened = [t for t in trades if t.get("status") == "OPEN"]
-
-    if len(opened) >= MAX_OPEN:
-        return False
-
-    trades.append({
-        "id": signal["id"],
-        "symbol": signal["symbol"],
-        "direction": signal["direction"],
-        "entry": signal["entry"],
-        "stop": signal["stop"],
-        "tp1": signal["tp1"],
-        "tp2": signal["tp2"],
-        "tp3": signal["tp3"],
-        "margin": signal["margin"],
-        "position_value": signal["position_value"],
-        "status": "OPEN",
-        "result": None,
-        "pnl_usdt": None,
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-        "last_checked": signal["candle_time"],
-    })
-
-    save_history(history)
-    return True
+    return changed
 
 
-def paper_stats(history):
+def backtest_one_hour(df_raw):
+    """
+    Exploratory out-of-sample test:
+    - chronological 70/30 split
+    - signals use data available up to each signal candle
+    - entry at the next candle open
+    - stop-first if stop and target are both touched
+    - estimated fees and slippage deducted
+
+    This is a simplified test, not proof of future profitability.
+    """
+    if len(df_raw) < 220:
+        return {
+            "trades": 0, "wins": 0, "net": 0.0,
+            "pf": None, "expectancy": None
+        }
+
+    df = add_indicators(df_raw).reset_index(drop=True)
+    split = int(len(df) * 0.70)
+    start = max(split, 100)
+    results = []
+
+    # Keep the test set separate from the earlier chronological segment.
+    for i in range(start, len(df) - BACKTEST_HORIZON - 1):
+        history = df.iloc[:i + 1].copy()
+        sig = detect_breakout_retest(history)
+
+        if sig is None:
+            continue
+
+        current = df.iloc[i]
+        entry_candle = df.iloc[i + 1]
+        entry = float(entry_candle["open"])
+        atr = float(current["atr"])
+
+        if entry <= 0 or atr <= 0:
+            continue
+
+        side = sig["side"]
+        distance = atr * ATR_MULTIPLIER
+
+        if side == "LONG":
+            stop = entry - distance
+            target = entry + distance * TARGET_R
+        else:
+            stop = entry + distance
+            target = entry - distance * TARGET_R
+
+        exit_price = None
+
+        future = df.iloc[
+            i + 1:i + 1 + BACKTEST_HORIZON
+        ]
+
+        for _, candle in future.iterrows():
+            high = float(candle["high"])
+            low = float(candle["low"])
+
+            if side == "LONG":
+                if low <= stop:
+                    exit_price = stop
+                    break
+                if high >= target:
+                    exit_price = target
+                    break
+            else:
+                if high >= stop:
+                    exit_price = stop
+                    break
+                if low <= target:
+                    exit_price = target
+                    break
+
+        if exit_price is None:
+            # Conservative time exit at the last candle close.
+            exit_price = float(future.iloc[-1]["close"])
+
+        qty = NOTIONAL_PER_TRADE / entry
+        gross = (
+            (exit_price - entry) * qty
+            if side == "LONG"
+            else (entry - exit_price) * qty
+        )
+
+        # Approximate round-trip cost; not a verified exchange fee quote.
+        cost = NOTIONAL_PER_TRADE * (
+            ROUND_TRIP_COST_PCT + SLIPPAGE_PCT
+        ) / 100.0
+
+        net = gross - cost
+        results.append(net)
+
+    if not results:
+        return {
+            "trades": 0, "wins": 0, "net": 0.0,
+            "pf": None, "expectancy": None
+        }
+
+    wins = sum(1 for x in results if x > 0)
+    gross_profit = sum(x for x in results if x > 0)
+    gross_loss = abs(sum(x for x in results if x < 0))
+    pf = gross_profit / gross_loss if gross_loss > 0 else None
+
+    return {
+        "trades": len(results),
+        "wins": wins,
+        "net": sum(results),
+        "pf": pf,
+        "expectancy": sum(results) / len(results),
+    }
+
+
+def build_report(candidates, rejects, errors, backtest, history):
     closed = [
         t for t in history["trades"]
         if t.get("status") == "CLOSED"
+        and isinstance(t.get("pnl_usdt"), (int, float))
     ]
     opened = [
         t for t in history["trades"]
         if t.get("status") == "OPEN"
     ]
 
-    wins = sum(t.get("result") == "WIN" for t in closed)
-    losses = sum(t.get("result") == "LOSS" for t in closed)
-    pnl = sum(float(t.get("pnl_usdt") or 0) for t in closed)
+    actual_count = len(closed)
+    actual_wins = sum(1 for t in closed if t["pnl_usdt"] > 0)
+    actual_net = sum(t["pnl_usdt"] for t in closed)
 
-    equity = CAPITAL
-    peak = CAPITAL
-    max_dd = 0.0
+    if actual_count:
+        actual_wr = actual_wins / actual_count * 100
+        actual_wr_text = f"{actual_wr:.1f}%"
+    else:
+        actual_wr_text = "هنوز داده کافی نیست (۰ معامله بسته‌شده)"
 
-    for t in sorted(closed, key=lambda x: x.get("closed_at", "")):
-        equity += float(t.get("pnl_usdt") or 0)
-        peak = max(peak, equity)
+    lines = [
+        BOT_NAME,
+        "━━━━━━━━━━━━━━━━━━",
+        "📊 گزارش بازار | PAPER ONLY",
+        f"🕒 {utc_now()}",
+        "🚫 سفارش واقعی: خاموش",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
 
-        if peak > 0:
-            max_dd = max(max_dd, (peak - equity) / peak * 100)
+    if candidates:
+        lines.append(f"✅ سیگنال‌های واجد شرایط: {len(candidates)}")
+        for s in candidates:
+            lines.extend([
+                "──────────────",
+                f"{s['symbol']} | {s['side']}",
+                f"ورود فرضی: {s['entry']:.8g}",
+                f"حد ضرر: {s['stop']:.8g}",
+                f"هدف TP1: {s['target']:.8g}",
+                f"امتیاز سیگنال: {s['score']}/100",
+                f"قدرت روند: {s['trend_strength']}/100",
+                f"RSI 15m: {s['rsi']:.1f}",
+                f"نسبت حجم: {s['volume_ratio']:.2f}x",
+                "⚠️ امتیاز فنی، احتمال برد نیست.",
+            ])
+    else:
+        lines.append("⚪ WAIT — سیگنال واجد شرایط پیدا نشد.")
 
-    return {
-        "closed": len(closed),
-        "opened": len(opened),
-        "wins": wins,
-        "losses": losses,
-        "pnl": pnl,
-        "win_rate": wins / len(closed) * 100 if closed else None,
-        "max_dd": max_dd,
-    }
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━",
+        f"بازارهای بررسی‌شده: {len(MARKETS)}",
+        f"خطاهای دریافت/تحلیل: {errors}",
+    ])
 
+    if rejects:
+        lines.append("دلایل پرتکرار رد:")
+        for reason, count in sorted(
+            rejects.items(), key=lambda x: x[1], reverse=True
+        )[:5]:
+            lines.append(f"• {reason}: {count}")
 
-def fmt_price(value):
-    if value >= 1000:
-        return f"{value:,.2f}"
-    if value >= 1:
-        return f"{value:.4f}"
-    return f"{value:.7f}".rstrip("0").rstrip(".")
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━",
+        "🧪 بک‌تست اکتشافی ۱ساعته (بخش ارزیابی جدا):",
+        f"معاملات: {backtest['trades']}",
+    ])
 
+    if backtest["trades"] > 0:
+        wr = backtest["wins"] / backtest["trades"] * 100
+        lines.append(f"نرخ برد بک‌تست: {wr:.1f}%")
+        lines.append(f"سود/زیان خالص فرضی: {backtest['net']:+.4f} USDT")
 
-def signal_message(s, index):
-    side = "🟢 LONG" if s["direction"] == "LONG" else "🔴 SHORT"
+        if backtest["expectancy"] is not None:
+            lines.append(
+                f"میانگین سود/زیان هر معامله: "
+                f"{backtest['expectancy']:+.4f} USDT"
+            )
 
-    return (
-        f"🐋 ETH WHALE V5.2\n"
-        f"سیگنال برتر #{index}: {s['symbol']}\n"
-        f"{side}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 ورود فرضی: {fmt_price(s['entry'])}\n"
-        f"🛑 حد ضرر: {fmt_price(s['stop'])}\n"
-        f"✅ TP1: {fmt_price(s['tp1'])}\n"
-        f"✅ TP2: {fmt_price(s['tp2'])}\n"
-        f"✅ TP3: {fmt_price(s['tp3'])}\n"
-        f"📊 قدرت تأیید روند: {s['trend_score']}/100\n"
-        f"🧮 امتیاز سیگنال: {s['signal_score']}/100\n"
-        f"📈 RSI: {s['rsi']:.1f}\n"
-        f"📦 نسبت حجم: {s['volume_ratio']:.2f}x\n"
-        f"💵 مارجین فرضی: {MARGIN:.2f} USDT\n"
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x\n"
-        f"💰 ارزش فرضی موقعیت: {MARGIN * LEVERAGE:.2f} USDT\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        + "\n".join("• " + r for r in s["reasons"])
-        + "\n🚫 سفارش واقعی: خاموش"
-    )
+        if backtest["pf"] is not None:
+            lines.append(f"Profit Factor: {backtest['pf']:.2f}")
+        else:
+            lines.append("Profit Factor: قابل محاسبه نیست")
+    else:
+        lines.append("داده کافی برای بک‌تست وجود ندارد.")
+
+    lines.extend([
+        "⚠️ بک‌تست ساده است و سود آینده را تضمین نمی‌کند.",
+        "━━━━━━━━━━━━━━━━━━",
+        f"معاملات کاغذی بسته‌شده: {actual_count}",
+        f"نرخ برد معاملات کاغذی: {actual_wr_text}",
+        f"سود/زیان خالص ثبت‌شده: {actual_net:+.4f} USDT",
+        f"معاملات باز آزمایشی: {len(opened)}",
+        f"سرمایه پایه آزمایشی: {CAPITAL:.2f} USDT",
+        f"مارجین فرضی هر معامله: {MARGIN_PER_TRADE:.2f} USDT",
+        f"اهرم محاسباتی: {LEVERAGE:.1f}x",
+        f"ارزش اسمی هر موقعیت: {NOTIONAL_PER_TRADE:.2f} USDT",
+        f"هزینه فرضی رفت‌وبرگشت: {ROUND_TRIP_COST_PCT:.2f}%",
+        f"لغزش فرضی: {SLIPPAGE_PCT:.2f}%",
+        "🧪 همه معاملات فقط شبیه‌سازی هستند.",
+    ])
+
+    return "\n".join(lines)
 
 
 def main():
     logging.info("Starting %s", BOT_NAME)
-    history = load_history()
-    update_paper(history)
 
+    frames_by_symbol = {}
+    rejects = {}
     candidates = []
-    rejected = {}
     errors = 0
+    backtest_results = []
 
-    for name, pair in MARKETS:
+    for symbol, pair in MARKETS:
         try:
-            signal, reason = analyze((name, pair))
+            frames = {}
+            for name, interval in TIMEFRAMES.items():
+                frames[name] = fetch_ohlc(pair, interval)
+                time.sleep(0.25)
+
+            frames_by_symbol[symbol] = frames
+
+            signal, reason = analyze_market(symbol, pair, frames)
 
             if signal:
                 candidates.append(signal)
-                logging.info(
-                    "%s %s trend=%s score=%s",
-                    name, signal["direction"],
-                    signal["trend_score"], signal["signal_score"],
-                )
-            else:
-                rejected[reason] = rejected.get(reason, 0) + 1
-                logging.info("%s skipped: %s", name, reason)
+            elif reason:
+                rejects[reason] = rejects.get(reason, 0) + 1
+
+            # One exploratory test per market; hourly candles only.
+            try:
+                test = backtest_one_hour(frames["1h"])
+                if test["trades"] > 0:
+                    backtest_results.append(test)
+            except Exception as exc:
+                logging.warning("Backtest failed for %s: %s", symbol, exc)
 
         except Exception as exc:
             errors += 1
-            rejected["خطای دریافت/تحلیل داده"] = (
-                rejected.get("خطای دریافت/تحلیل داده", 0) + 1
+            logging.error("Market %s failed: %s", symbol, exc)
+            rejects["خطای دریافت/تحلیل"] = (
+                rejects.get("خطای دریافت/تحلیل", 0) + 1
             )
-            logging.error("%s failed: %s", name, exc)
 
-        time.sleep(0.25)
+    history = load_history()
 
+    # Update existing paper trades using the newly fetched 15m candles.
+    update_open_trades(history, frames_by_symbol)
+
+    # Keep the highest-scoring signals only; do not force weak signals.
     candidates.sort(
-        key=lambda s: (s["trend_score"], s["signal_score"]),
-        reverse=True,
+        key=lambda s: (s["score"], s["trend_strength"]),
+        reverse=True
     )
-    signals = candidates[:MAX_SIGNALS]
 
-    for signal in signals:
-        register_paper_trade(signal, history)
+    added = 0
+    for signal in candidates:
+        if added >= MAX_SIGNALS:
+            break
+        if add_paper_trade(history, signal):
+            added += 1
 
     save_history(history)
 
-    bt = run_backtests()
-    stats = paper_stats(history)
+    # Pool test outcomes approximately by weighting each market's expectancy.
+    # The displayed PF is computed from pooled gross approximations only when
+    # data are available; this is still a limited recent-history test.
+    total_test_trades = sum(x["trades"] for x in backtest_results)
+    total_test_wins = sum(x["wins"] for x in backtest_results)
+    total_test_net = sum(x["net"] for x in backtest_results)
 
-    lines = [
-        "🐋 ETH WHALE V5.2",
-        "━━━━━━━━━━━━━━━━━━",
-        "📊 SMART MARKET WATCH",
-        "🧪 PAPER TRADING ONLY",
-        "🚫 سفارش واقعی: خاموش",
-        f"🕒 {now_text()}",
-        "━━━━━━━━━━━━━━━━━━",
-        (
-            f"✅ سیگنال‌های واجد شرایط: {len(signals)}"
-            if signals else
-            "⚪ WAIT — سیگنال واجد شرایط پیدا نشد"
+    # Approximate pooled PF using each market's net result is not valid.
+    # Do not present a fabricated aggregate PF.
+    backtest = {
+        "trades": total_test_trades,
+        "wins": total_test_wins,
+        "net": total_test_net,
+        "pf": None,
+        "expectancy": (
+            total_test_net / total_test_trades
+            if total_test_trades else None
         ),
-        "سیگنال ضعیف برای تکمیل سهمیه ساخته نمی‌شود.",
-        "",
-        f"🔎 بازارهای بررسی‌شده: {len(MARKETS)}",
-        f"⚠️ خطاهای دریافت/تحلیل: {errors}",
-        f"🎚 حداقل قدرت روند: {MIN_TREND}/100",
-        f"🎚 حداقل امتیاز سیگنال: {MIN_SCORE}/100",
-        "",
-        "📉 دلایل اصلی رد بازارها:",
-    ]
+    }
 
-    if rejected:
-        for reason, count in sorted(
-            rejected.items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:5]:
-            lines.append(f"• {reason}: {count}")
-    else:
-        lines.append("• موردی ثبت نشد")
+    report = build_report(
+        candidates, rejects, errors, backtest, history
+    )
 
-    lines.extend(["", "🧪 آزمون تاریخی ساده ۱ساعته:"])
-
-    if bt["trades"] >= MIN_BACKTEST_TRADES:
-        lines.append(f"نرخ برد پس از هزینه فرضی: {bt['win_rate']:.1f}%")
-        lines.append(f"معاملات آزمون: {bt['trades']}")
-        lines.append(
-            "میانگین نتیجه: "
-            f"{bt['expectancy_r']:+.3f}R در هر معامله"
-        )
-        lines.append(
-            "Profit Factor تجمیعیِ تقریبی: "
-            + (
-                f"{bt['profit_factor']:.2f}"
-                if bt["profit_factor"] is not None
-                else "نامشخص"
-            )
-        )
-        lines.append(
-            f"بیشترین افت تجمعی در آزمون هر بازار: "
-            f"{bt['max_dd_r']:.2f}R"
-        )
-        lines.append(
-            "⚠️ آزمون ساده است؛ نرخ برد آینده را تضمین نمی‌کند."
-        )
-    else:
-        lines.append(
-            f"نرخ برد: تأییدنشده؛ {bt['trades']} معامله آزمون "
-            f"(حداقل {MIN_BACKTEST_TRADES})"
-        )
-
-    lines.extend([
-        "",
-        "📒 معاملات آزمایشی ثبت‌شده:",
-    ])
-
-    if stats["closed"] >= MIN_BACKTEST_TRADES:
-        lines.append(f"نرخ برد ثبت‌شده: {stats['win_rate']:.1f}%")
-    else:
-        lines.append(
-            f"نرخ برد ثبت‌شده: تأییدنشده؛ {stats['closed']} "
-            f"معامله بسته‌شده"
-        )
-
-    lines.extend([
-        f"معاملات باز: {stats['opened']}",
-        f"برد/باخت بسته‌شده: {stats['wins']}/{stats['losses']}",
-        f"سود/زیان بسته‌شده پس از هزینه فرضی: {stats['pnl']:+.4f} USDT",
-        f"افت سرمایه ثبت‌شده: {stats['max_dd']:.2f}%",
-        "",
-        f"💰 سرمایه آزمایشی: {CAPITAL:.2f} USDT",
-        f"⚙️ اهرم محاسباتی: {LEVERAGE}x",
-        f"🧾 هزینه رفت‌وبرگشت فرضی: {ROUND_TRIP_COST_PCT:.2f}%",
-        "قدرت روند، احتمال برد نیست.",
-        "تمام معاملات شبیه‌سازی هستند.",
-    ])
-
-    send_telegram("\n".join(lines))
-
-    for i, signal in enumerate(signals, 1):
-        send_telegram(signal_message(signal, i))
-        time.sleep(1)
-
-    logging.info("Scan complete.")
+    print(report)
+    telegram_send(report)
 
 
 if __name__ == "__main__":
