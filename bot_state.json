@@ -60,5 +60,58 @@
       "highest_tp": 0
     }
   ],
-  "history": []
+  "history": [],
+  "active_trades": {
+    "GLDON_USDT": {
+      "symbol": "GLDON_USDT",
+      "direction": "SHORT",
+      "entry": 382.74,
+      "stop": 385.80192,
+      "tp1": 379.67808,
+      "tp2": 376.61616,
+      "tp3": 373.55424,
+      "change_pct": -2.4692301811788084,
+      "consistency": 68.96551724137932,
+      "score": 81.4,
+      "trades_count": 30,
+      "opened_at": 1792167669.10212,
+      "reached_targets": []
+    },
+    "SNT_USDT": {
+      "symbol": "SNT_USDT",
+      "direction": "LONG",
+      "entry": 0.007629,
+      "stop": 0.0075679680000000004,
+      "tp1": 0.007690032,
+      "tp2": 0.007751064,
+      "tp3": 0.007812096,
+      "change_pct": 1.8150273588682864,
+      "consistency": 68.96551724137932,
+      "score": 81.4,
+      "trades_count": 30,
+      "opened_at": 1792167667.645424,
+      "reached_targets": []
+    },
+    "SLVON_USDT": {
+      "symbol": "SLVON_USDT",
+      "direction": "SHORT",
+      "entry": 51.8179,
+      "stop": 52.2324432,
+      "tp1": 51.403356800000005,
+      "tp2": 50.9888136,
+      "tp3": 50.5742704,
+      "change_pct": -1.0617863825562315,
+      "consistency": 68.96551724137932,
+      "score": 81.4,
+      "trades_count": 30,
+      "opened_at": 1792167665.1422198,
+      "reached_targets": []
+    }
+  },
+  "last_signal_at": {
+    "GLDON_USDT": 1792167713.9969573,
+    "SNT_USDT": 1792167715.6052616,
+    "SLVON_USDT": 1792167716.0139399
+  },
+  "updated_at": "2026-10-16 16:21 UTC"
 }
