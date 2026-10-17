@@ -1,1043 +1,1086 @@
 
 import os
+import sys
 import json
 import time
 import base64
 import logging
-import random
-import requests
-
+import threading
 from datetime import datetime, timezone
-from urllib.parse import quote
+
+import requests
+import websocket
 
 # ============================================================
-# ETH WHALE | BITPIN SPOT PAPER SIGNALS
-# NO REAL ORDERS - NO FUTURES - NO LEVERAGE
+# ETH WHALE | BITPIN WEBSOCKET PAPER SPOT SIGNAL BOT
+# PAPER ONLY - NO REAL ORDERS - NO LEVERAGE
 # ============================================================
 
 BOT_NAME = "🐋 ETH WHALE"
-BASE_URL = "https://api.bitpin.ir"
-GITHUB_API = "https://api.github.com"
 
-MARKETS_URL = f"{BASE_URL}/v1/mkt/markets/"
-TRADES_URL = f"{BASE_URL}/api/v1/mth/matches/"
+BASE_URL = "https://api.bitpin.org"
+WS_URL = "wss://centrifugo.bitpin.org/connection/websocket"
+
+MARKETS_URL = BASE_URL + "/v1/mkt/markets/"
+HISTORY_FILE = "data/market_history.json"
 
 CAPITAL_USDT = 48.0
 MAX_MARKETS = 25
 MAX_SIGNALS = 3
+TIMEFRAME = "15m"
+CANDLE_SECONDS = 15 * 60
+MIN_CANDLES = 21
 
-CANDLE_MINUTES = 15
-CANDLE_SECONDS = CANDLE_MINUTES * 60
-MIN_CLOSED_CANDLES = 21
-MAX_CANDLE_HISTORY = 300
-MAX_SEEN_TRADE_IDS = 5000
+PAPER_MODE = True
+REAL_ORDERS_ENABLED = False
 
-SUPPORT_ZONE_PERCENT = 0.012
-MAX_STOP_PERCENT = 0.045
-MAX_TRADE_AGE_MINUTES = 30
-
-REQUEST_DELAY_SECONDS = 1.5
+WS_LISTEN_SECONDS = 24
+REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
-RETRY_BASE_SECONDS = 8
-REQUEST_TIMEOUT = 20
+REQUEST_DELAY_SECONDS = 0.5
 
-STATE_PATH = "data/market_history.json"
+MAX_HISTORY_CANDLES = 250
+MAX_MARKET_AGE_MINUTES = 30
 
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
-    or ""
-).strip()
-
-CHAT_ID = (
-    os.getenv("TELEGRAM_CHAT_ID")
-    or os.getenv("CHAT_ID")
-    or ""
-).strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
-GITHUB_BRANCH = os.getenv("GITHUB_REF_NAME", "main")
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "main").strip()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-Paper-Bot/9.0",
-    "Accept": "application/json"
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "ETH-WHALE-Paper-Bot/10.0",
+    "Accept": "application/json",
 })
 
+state_lock = threading.Lock()
+received_candles = {}
+subscribed_symbols = []
+ws_connected = False
+ws_ready = threading.Event()
+ws_error = None
+
 
 # ============================================================
-# EXCEPTIONS
+# GENERAL HELPERS
 # ============================================================
 
-class RateLimitError(Exception):
-    """Raised when the exchange continues rate limiting requests."""
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def utc_text():
+    return utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def number(value, default=0.0):
+
+def safe_float(value, default=0.0):
     try:
-        result = float(value)
-        if result != result or abs(result) == float("inf"):
-            return default
-        return result
-    except (TypeError, ValueError, OverflowError):
+        return float(value)
+    except (TypeError, ValueError):
         return default
 
 
-def utc_text(timestamp=None):
-    if timestamp is None:
-        timestamp = time.time()
+def normalize_symbol(value):
+    if not value:
+        return ""
 
-    return datetime.fromtimestamp(
-        timestamp, timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    value = str(value).strip().upper()
+    value = value.replace("-", "_").replace("/", "_")
 
+    return value
 
-def parse_timestamp(value):
-    if value is None:
-        return 0.0
 
-    if isinstance(value, (int, float)):
-        stamp = float(value)
-        if stamp > 100000000000:
-            stamp /= 1000.0
-        return stamp if stamp > 0 else 0.0
-
-    if isinstance(value, str):
-        value = value.strip()
-
-        try:
-            stamp = float(value)
-            if stamp > 100000000000:
-                stamp /= 1000.0
-            return stamp if stamp > 0 else 0.0
-        except ValueError:
-            pass
-
-        try:
-            if value.endswith("Z"):
-                value = value[:-1] + "+00:00"
-
-            dt = datetime.fromisoformat(value)
-
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            return dt.timestamp()
-        except (ValueError, OverflowError):
-            return 0.0
-
-    return 0.0
-
-
-def api_get(url, params=None, timeout=REQUEST_TIMEOUT):
-    """
-    Retry only rate limits, transient server errors and network failures.
-    Client errors such as 400/404/406 are not retried.
-    """
-
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            response = SESSION.get(
-                url,
-                params=params,
-                timeout=timeout
-            )
-
-        except requests.RequestException:
-            if attempt >= MAX_RETRIES:
-                raise
-
-            delay = RETRY_BASE_SECONDS * (2 ** attempt)
-            delay += random.uniform(0.5, 2.0)
-
-            logging.warning(
-                "Network error; retry %s/%s in %.1fs",
-                attempt + 1, MAX_RETRIES, delay
-            )
-            time.sleep(delay)
-            continue
-
-        status = response.status_code
-
-        if status in (429, 500, 502, 503, 504):
-            if attempt >= MAX_RETRIES:
-                if status == 429:
-                    raise RateLimitError(
-                        "Bitpin HTTP 429 persisted after retries."
-                    )
-                response.raise_for_status()
-
-            retry_after = number(
-                response.headers.get("Retry-After"), 0
-            )
-
-            delay = max(
-                retry_after,
-                RETRY_BASE_SECONDS * (2 ** attempt)
-            )
-            delay += random.uniform(0.5, 2.0)
-
-            logging.warning(
-                "HTTP %s; retry %s/%s in %.1fs",
-                status, attempt + 1, MAX_RETRIES, delay
-            )
-
-            time.sleep(delay)
-            continue
-
-        # Do not retry other HTTP errors.
-        response.raise_for_status()
-        return response.json()
-
-    raise RuntimeError("Request retries exhausted.")
-
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.error("Telegram credentials are missing.")
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    try:
-        response = SESSION.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True
-            },
-            timeout=REQUEST_TIMEOUT
-        )
-
-        response.raise_for_status()
-        return bool(response.json().get("ok"))
-
-    except Exception as exc:
-        logging.error("Telegram send failed: %s", exc)
-        return False
-
-
-def fmt_price(value):
-    value = number(value)
-
-    if value >= 1000:
-        return f"{value:,.2f}"
-
-    if value >= 1:
-        return f"{value:.6f}".rstrip("0").rstrip(".")
-
-    return f"{value:.8f}".rstrip("0").rstrip(".")
-
-
-# ============================================================
-# GITHUB HISTORY
-# ============================================================
-
-def github_headers():
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
-    }
-
-
-def load_state():
-    empty = {"markets": {}}
-
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        logging.warning("GitHub persistence is not configured.")
-        return empty, None
-
-    url = (
-        f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}"
-        f"/contents/{STATE_PATH}"
-    )
-
-    try:
-        response = SESSION.get(
-            url,
-            headers=github_headers(),
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code == 404:
-            return empty, None
-
-        response.raise_for_status()
-        payload = response.json()
-
-        raw = base64.b64decode(
-            payload.get("content", "")
-        ).decode("utf-8")
-
-        state = json.loads(raw)
-
-        if not isinstance(state, dict):
-            state = empty
-
-        if not isinstance(state.get("markets"), dict):
-            state["markets"] = {}
-
-        logging.info("Saved history loaded from GitHub.")
-        return state, payload.get("sha")
-
-    except Exception as exc:
-        logging.error("Could not load saved history: %s", exc)
-        return empty, None
-
-
-def save_state(state, sha):
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        logging.warning("History was not saved permanently.")
-        return False
-
-    url = (
-        f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}"
-        f"/contents/{STATE_PATH}"
-    )
-
-    raw = json.dumps(
-        state,
-        ensure_ascii=False,
-        separators=(",", ":")
-    ).encode("utf-8")
-
-    if len(raw) > 850000:
-        logging.error("History file too large; save cancelled.")
-        return False
-
-    payload = {
-        "message": "Update ETH WHALE market history",
-        "content": base64.b64encode(raw).decode("ascii"),
-        "branch": GITHUB_BRANCH
-    }
-
-    if sha:
-        payload["sha"] = sha
-
-    try:
-        response = SESSION.put(
-            url,
-            headers=github_headers(),
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code not in (200, 201):
-            logging.error(
-                "History save failed: HTTP %s %s",
-                response.status_code,
-                response.text[:300]
-            )
-            return False
-
-        logging.info("Market history saved to GitHub.")
-        return True
-
-    except Exception as exc:
-        logging.error("Could not save history: %s", exc)
-        return False
-
-
-# ============================================================
-# MARKET LIST
-# ============================================================
-
-def get_symbol(market):
-    for key in ("symbol", "code", "market", "name"):
+def symbol_from_market(market):
+    for key in ("symbol", "code", "market", "name", "ticker"):
         value = market.get(key)
 
         if isinstance(value, str):
-            value = value.upper().replace("-", "_").strip()
+            symbol = normalize_symbol(value)
 
-            if value.endswith("_USDT"):
-                return value
+            if "_" in symbol and symbol.endswith("_USDT"):
+                return symbol
 
-    base = market.get("base_currency") or market.get("base")
-    quote_currency = (
-        market.get("quote_currency")
+    base = (
+        market.get("currency1")
+        or market.get("base_currency")
+        or market.get("base")
+    )
+    quote = (
+        market.get("currency2")
+        or market.get("quote_currency")
         or market.get("quote")
     )
 
-    if isinstance(base, dict):
-        base = base.get("code") or base.get("symbol")
-
-    if isinstance(quote_currency, dict):
-        quote_currency = (
-            quote_currency.get("code")
-            or quote_currency.get("symbol")
-        )
-
-    if base and str(quote_currency).upper() == "USDT":
-        return str(base).upper() + "_USDT"
+    if base and quote:
+        if str(quote).upper() == "USDT":
+            return normalize_symbol(f"{base}_USDT")
 
     return ""
 
 
-def get_volume(market):
-    keys = (
-        "quote_volume", "quoteVolume", "volume_24h",
-        "volume24h", "volume", "turnover"
-    )
-
-    for key in keys:
-        value = number(market.get(key))
+def market_volume(market):
+    for key in (
+        "quote_volume",
+        "volume_24h",
+        "volume",
+        "value",
+        "amount",
+        "trading_volume",
+    ):
+        value = safe_float(market.get(key))
         if value > 0:
             return value
-
-    info = market.get("price_info")
-
-    if isinstance(info, dict):
-        for key in keys:
-            value = number(info.get(key))
-            if value > 0:
-                return value
 
     return 0.0
 
 
-def fetch_markets():
-    payload = api_get(MARKETS_URL)
-
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict):
-        rows = payload.get("results", [])
-    else:
-        rows = []
-
-    if not isinstance(rows, list):
-        raise RuntimeError("Unexpected Bitpin markets response.")
-
-    found = {}
-
-    for market in rows:
-        if not isinstance(market, dict):
-            continue
-
-        symbol = get_symbol(market)
-
-        if not symbol:
-            continue
-
-        base = symbol[:-5]
-
-        if base in {"BUSD", "DAI", "PERP", "RDNT"}:
-            continue
-
-        market["_bot_symbol"] = symbol
-        market["_bot_volume"] = get_volume(market)
-        found[symbol] = market
-
-    markets = list(found.values())
-    markets.sort(
-        key=lambda item: item.get("_bot_volume", 0),
-        reverse=True
-    )
-
-    selected = markets[:MAX_MARKETS]
-
-    if not selected:
-        raise RuntimeError("No eligible USDT markets found.")
-
-    logging.info(
-        "USDT markets found: %s | selected: %s",
-        len(markets), len(selected)
-    )
-
-    return selected
-
-
 # ============================================================
-# RECENT TRADES
+# TELEGRAM
 # ============================================================
 
-def fetch_trades(symbol):
-    url = f"{TRADES_URL}{quote(symbol, safe='_')}/"
-
-    try:
-        payload = api_get(url)
-
-    except RateLimitError:
-        # Propagate rate limit so the whole scan stops safely.
-        raise
-
-    except requests.HTTPError as exc:
-        response = exc.response
-
-        if response is not None and response.status_code in (
-            400, 404, 406
-        ):
-            logging.warning(
-                "Skipping unsupported market %s (HTTP %s)",
-                symbol, response.status_code
-            )
-            return []
-
-        raise
-
-    if isinstance(payload, list):
-        rows = payload
-    elif isinstance(payload, dict):
-        rows = (
-            payload.get("results")
-            or payload.get("trades")
-            or payload.get("data")
-            or []
-        )
-    else:
-        rows = []
-
-    if not isinstance(rows, list):
-        return []
-
-    valid = []
-
-    for trade in rows:
-        if not isinstance(trade, dict):
-            continue
-
-        price = number(trade.get("price"))
-
-        stamp = parse_timestamp(
-            trade.get("time")
-            or trade.get("timestamp")
-            or trade.get("created_at")
-        )
-
-        if price <= 0 or stamp <= 0:
-            continue
-
-        trade_id = trade.get("id")
-
-        if trade_id is None:
-            trade_id = (
-                f"{int(stamp * 1000)}:{price}:"
-                f"{trade.get('base_amount', '')}:"
-                f"{trade.get('side', '')}"
-            )
-
-        base_amount = number(trade.get("base_amount"))
-        quote_amount = number(
-            trade.get("quote_amount"),
-            price * base_amount
-        )
-
-        valid.append({
-            "id": str(trade_id),
-            "time": stamp,
-            "price": price,
-            "quote_amount": quote_amount
-        })
-
-    valid.sort(key=lambda item: item["time"])
-    return valid
-
-
-# ============================================================
-# CANDLE HISTORY
-# ============================================================
-
-def empty_market_state():
-    return {"candles": [], "seen_ids": []}
-
-
-def update_market_history(old_state, trades, now_ts):
-    if not isinstance(old_state, dict):
-        old_state = empty_market_state()
-
-    candles = old_state.get("candles", [])
-    seen_ids = old_state.get("seen_ids", [])
-
-    if not isinstance(candles, list):
-        candles = []
-
-    if not isinstance(seen_ids, list):
-        seen_ids = []
-
-    seen = set(str(value) for value in seen_ids)
-    candle_map = {}
-
-    for candle in candles:
-        if not isinstance(candle, dict):
-            continue
-
-        bucket = int(number(candle.get("t"), -1))
-
-        if bucket >= 0:
-            candle_map[bucket] = candle
-
-    for trade in trades:
-        trade_id = str(trade["id"])
-
-        if trade_id in seen:
-            continue
-
-        seen.add(trade_id)
-
-        stamp = trade["time"]
-        price = trade["price"]
-        bucket = int(stamp // CANDLE_SECONDS) * CANDLE_SECONDS
-
-        candle = candle_map.get(bucket)
-
-        if candle is None:
-            candle = {
-                "t": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "first_time": stamp,
-                "last_time": stamp,
-                "trades": 0,
-                "volume": 0.0
-            }
-            candle_map[bucket] = candle
-
-        candle["high"] = max(
-            number(candle.get("high"), price), price
-        )
-        candle["low"] = min(
-            number(candle.get("low"), price), price
-        )
-
-        if stamp < number(candle.get("first_time"), stamp):
-            candle["first_time"] = stamp
-            candle["open"] = price
-
-        if stamp >= number(candle.get("last_time"), stamp):
-            candle["last_time"] = stamp
-            candle["close"] = price
-
-        candle["trades"] = int(
-            number(candle.get("trades"), 0)
-        ) + 1
-
-        candle["volume"] = (
-            number(candle.get("volume"), 0)
-            + number(trade.get("quote_amount"), 0)
-        )
-
-    cutoff = now_ts - MAX_CANDLE_HISTORY * CANDLE_SECONDS
-
-    candle_list = [
-        candle for bucket, candle in candle_map.items()
-        if bucket >= cutoff
-    ]
-    candle_list.sort(key=lambda item: item["t"])
-
-    # Keep the newest IDs deterministically.
-    seen_list = list(seen)
-
-    if len(seen_list) > MAX_SEEN_TRADE_IDS:
-        seen_list = seen_list[-MAX_SEEN_TRADE_IDS:]
-
-    return {
-        "candles": candle_list,
-        "seen_ids": seen_list
-    }
-
-
-def get_closed_candles(market_state, now_ts):
-    current_bucket = int(now_ts // CANDLE_SECONDS) * CANDLE_SECONDS
-
-    return [
-        candle
-        for candle in market_state.get("candles", [])
-        if number(candle.get("t"), current_bucket) < current_bucket
-    ]
-
-
-def consecutive_enough(candles, count):
-    if len(candles) < count:
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("Telegram credentials are missing.")
+        print(message)
         return False
 
-    recent = candles[-count:]
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendMessage"
+    )
 
-    for index in range(1, len(recent)):
-        if (
-            int(recent[index]["t"])
-            - int(recent[index - 1]["t"])
-        ) != CANDLE_SECONDS:
-            return False
+    try:
+        response = session.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    return True
+        if response.ok:
+            logging.info("Telegram message sent.")
+            return True
+
+        logging.error(
+            "Telegram error: HTTP %s %s",
+            response.status_code,
+            response.text[:300],
+        )
+
+    except requests.RequestException as exc:
+        logging.error("Telegram request failed: %s", exc)
+
+    return False
+
+
+# ============================================================
+# BITPIN MARKET LIST
+# ============================================================
+
+def get_markets():
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(
+                MARKETS_URL,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            response.raise_for_status()
+            payload = response.json()
+
+            if isinstance(payload, dict):
+                markets = payload.get("results", [])
+            elif isinstance(payload, list):
+                markets = payload
+            else:
+                markets = []
+
+            if not isinstance(markets, list) or not markets:
+                raise ValueError(
+                    "Bitpin returned an empty or unexpected market list."
+                )
+
+            selected = {}
+
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+
+                symbol = symbol_from_market(market)
+
+                if not symbol or not symbol.endswith("_USDT"):
+                    continue
+
+                if market.get("tradable") is False:
+                    continue
+
+                # Keep one entry per market.
+                selected[symbol] = {
+                    "symbol": symbol,
+                    "volume": market_volume(market),
+                }
+
+            result = sorted(
+                selected.values(),
+                key=lambda item: item["volume"],
+                reverse=True,
+            )[:MAX_MARKETS]
+
+            if not result:
+                raise ValueError(
+                    "No tradable USDT markets were recognized."
+                )
+
+            logging.info("Selected %s USDT markets.", len(result))
+            return [item["symbol"] for item in result]
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+        ) as exc:
+            last_error = exc
+            logging.warning(
+                "Market request attempt %s/%s failed: %s",
+                attempt,
+                MAX_RETRIES,
+                exc,
+            )
+
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 3)
+
+    raise RuntimeError(
+        "Could not retrieve Bitpin markets: " + str(last_error)
+    )
+
+
+# ============================================================
+# GITHUB HISTORY PERSISTENCE
+# ============================================================
+
+def github_file_url():
+    if not GITHUB_REPOSITORY:
+        return None
+
+    return (
+        "https://api.github.com/repos/"
+        + GITHUB_REPOSITORY
+        + "/contents/"
+        + HISTORY_FILE
+    )
+
+
+def load_history():
+    url = github_file_url()
+
+    if url and GITHUB_TOKEN:
+        try:
+            response = session.get(
+                url,
+                headers={
+                    "Authorization": "Bearer " + GITHUB_TOKEN,
+                    "Accept": "application/vnd.github+json",
+                },
+                params={"ref": GITHUB_REF_NAME},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                payload = response.json()
+                encoded = payload.get("content", "")
+                decoded = base64.b64decode(encoded).decode("utf-8")
+                data = json.loads(decoded)
+
+                if isinstance(data, dict):
+                    logging.info("History loaded from GitHub.")
+                    return data
+
+            elif response.status_code != 404:
+                logging.warning(
+                    "GitHub history read returned HTTP %s.",
+                    response.status_code,
+                )
+
+        except Exception as exc:
+            logging.warning("GitHub history read failed: %s", exc)
+
+    # Local fallback. On GitHub Actions, the workspace is temporary;
+    # GitHub persistence is needed to retain history between runs.
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if isinstance(data, dict):
+                return data
+
+    except Exception as exc:
+        logging.warning("Local history read failed: %s", exc)
+
+    return {"markets": {}}
+
+
+def save_history(history):
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+
+    content = json.dumps(
+        history,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    with open(HISTORY_FILE, "w", encoding="utf-8") as file:
+        file.write(content)
+
+    url = github_file_url()
+
+    if not url or not GITHUB_TOKEN:
+        logging.warning(
+            "History saved locally only; GitHub persistence is unavailable."
+        )
+        return False
+
+    headers = {
+        "Authorization": "Bearer " + GITHUB_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            existing = session.get(
+                url,
+                headers=headers,
+                params={"ref": GITHUB_REF_NAME},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            sha = None
+
+            if existing.status_code == 200:
+                sha = existing.json().get("sha")
+            elif existing.status_code != 404:
+                existing.raise_for_status()
+
+            body = {
+                "message": "Update ETH WHALE market candle history",
+                "content": base64.b64encode(
+                    content.encode("utf-8")
+                ).decode("ascii"),
+                "branch": GITHUB_REF_NAME,
+            }
+
+            if sha:
+                body["sha"] = sha
+
+            response = session.put(
+                url,
+                headers=headers,
+                json=body,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code in (200, 201):
+                logging.info("History persisted to GitHub.")
+                return True
+
+            logging.warning(
+                "GitHub history save HTTP %s: %s",
+                response.status_code,
+                response.text[:250],
+            )
+
+            # A SHA conflict can happen if another run changed the file.
+            if response.status_code not in (409, 422):
+                response.raise_for_status()
+
+        except Exception as exc:
+            logging.warning(
+                "GitHub save attempt %s/%s failed: %s",
+                attempt,
+                MAX_RETRIES,
+                exc,
+            )
+
+        if attempt < MAX_RETRIES:
+            time.sleep(attempt * 2)
+
+    return False
+
+
+# ============================================================
+# WEBSOCKET CANDLE COLLECTION
+# ============================================================
+
+def process_ws_message(ws, raw_message):
+    global ws_connected, ws_error
+
+    try:
+        message = json.loads(raw_message)
+    except (json.JSONDecodeError, TypeError):
+        return
+
+    # Centrifugo connection response.
+    if isinstance(message, dict) and "connect" in message:
+        if message.get("error"):
+            ws_error = str(message["error"])
+            logging.error("WebSocket connect error: %s", ws_error)
+            ws_ready.set()
+            return
+
+        ws_connected = True
+        logging.info("WebSocket connected.")
+
+        # Subscribe to public market channels.
+        for index, symbol in enumerate(subscribed_symbols, start=2):
+            command = {
+                "id": index,
+                "subscribe": {
+                    "channel": "market:" + symbol,
+                },
+            }
+
+            try:
+                ws.send(json.dumps(command))
+            except Exception as exc:
+                logging.warning(
+                    "Subscribe failed for %s: %s",
+                    symbol,
+                    exc,
+                )
+
+        ws_ready.set()
+        return
+
+    # Server-side push format:
+    # {"push":{"channel":"market:BTC_USDT","pub":{"data":{...}}}}
+    push = message.get("push") if isinstance(message, dict) else None
+
+    if not isinstance(push, dict):
+        return
+
+    channel = push.get("channel", "")
+    publication = push.get("pub", {})
+
+    if not isinstance(publication, dict):
+        return
+
+    data = publication.get("data", {})
+
+    if not isinstance(data, dict):
+        return
+
+    symbol = normalize_symbol(
+        data.get("symbol")
+        or channel.replace("market:", "")
+    )
+
+    if not symbol:
+        return
+
+    candles = data.get("candles", [])
+
+    if not isinstance(candles, list):
+        return
+
+    now_ts = int(time.time())
+
+    with state_lock:
+        bucket = received_candles.setdefault(symbol, {})
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            if candle.get("resolution") != TIMEFRAME:
+                continue
+
+            timestamp = int(safe_float(candle.get("ts"), -1))
+
+            if timestamp <= 0:
+                continue
+
+            # Do not use an unfinished candle for signal confirmation.
+            if timestamp + CANDLE_SECONDS > now_ts:
+                continue
+
+            try:
+                normalized = {
+                    "ts": timestamp,
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "volume": float(candle.get("volume", 0)),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if (
+                normalized["open"] <= 0
+                or normalized["high"] <= 0
+                or normalized["low"] <= 0
+                or normalized["close"] <= 0
+            ):
+                continue
+
+            bucket[timestamp] = normalized
+
+
+def on_ws_open(ws):
+    logging.info("WebSocket transport opened.")
+
+    # Public market channels do not require a private user token.
+    # This is the standard Centrifugo JSON connect command.
+    try:
+        ws.send(json.dumps({
+            "id": 1,
+            "connect": {},
+        }))
+    except Exception as exc:
+        global ws_error
+        ws_error = str(exc)
+        ws_ready.set()
+
+
+def on_ws_error(ws, error):
+    global ws_error
+    ws_error = str(error)
+    logging.error("WebSocket error: %s", error)
+    ws_ready.set()
+
+
+def on_ws_close(ws, status_code, message):
+    global ws_connected
+    ws_connected = False
+    logging.warning(
+        "WebSocket closed: %s %s",
+        status_code,
+        message,
+    )
+
+
+def collect_candles(symbols):
+    global received_candles, subscribed_symbols
+    global ws_connected, ws_error
+
+    with state_lock:
+        received_candles = {}
+        subscribed_symbols = list(symbols)
+
+    ws_connected = False
+    ws_error = None
+    ws_ready.clear()
+
+    app = websocket.WebSocketApp(
+        WS_URL,
+        on_open=on_ws_open,
+        on_message=process_ws_message,
+        on_error=on_ws_error,
+        on_close=on_ws_close,
+    )
+
+    thread = threading.Thread(
+        target=lambda: app.run_forever(
+            ping_interval=20,
+            ping_timeout=10,
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    # Wait for a connection response or an error.
+    ws_ready.wait(timeout=12)
+
+    if not ws_connected:
+        app.close()
+        raise RuntimeError(
+            "WebSocket did not confirm connection. "
+            + str(ws_error or "No connection response received.")
+        )
+
+    # The documentation says market candle updates are sent
+    # periodically. Keep the connection open to collect them.
+    time.sleep(WS_LISTEN_SECONDS)
+    app.close()
+    thread.join(timeout=3)
+
+    with state_lock:
+        snapshot = {
+            symbol: list(candles.values())
+            for symbol, candles in received_candles.items()
+        }
+
+    total = sum(len(items) for items in snapshot.values())
+    logging.info(
+        "Received %s closed %s candles across %s markets.",
+        total,
+        TIMEFRAME,
+        len(snapshot),
+    )
+
+    if total == 0:
+        raise RuntimeError(
+            "WebSocket connected but no closed 15m candles were received. "
+            "Check the subscription protocol and Bitpin response."
+        )
+
+    return snapshot
+
+
+# ============================================================
+# HISTORY UPDATE
+# ============================================================
+
+def update_history(history, new_candles):
+    if not isinstance(history, dict):
+        history = {"markets": {}}
+
+    markets = history.setdefault("markets", {})
+
+    for symbol, candles in new_candles.items():
+        old = markets.setdefault(symbol, [])
+
+        by_timestamp = {}
+
+        if isinstance(old, list):
+            for candle in old:
+                if not isinstance(candle, dict):
+                    continue
+
+                ts = int(safe_float(candle.get("ts"), -1))
+
+                if ts > 0:
+                    by_timestamp[ts] = candle
+
+        for candle in candles:
+            by_timestamp[int(candle["ts"])] = candle
+
+        sorted_candles = [
+            by_timestamp[ts]
+            for ts in sorted(by_timestamp)
+        ]
+
+        markets[symbol] = sorted_candles[-MAX_HISTORY_CANDLES:]
+
+    history["updated_at"] = utc_now().isoformat()
+    return history
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def ema(values, period):
+    if not values:
+        return 0.0
+
+    alpha = 2.0 / (period + 1.0)
+    result = float(values[0])
+
+    for value in values[1:]:
+        result = alpha * float(value) + (1.0 - alpha) * result
+
+    return result
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for index in range(1, len(values)):
+        difference = values[index] - values[index - 1]
+        gains.append(max(difference, 0.0))
+        losses.append(max(-difference, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for index in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[index]
+        ) / period
+        avg_loss = (
+            avg_loss * (period - 1) + losses[index]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 # ============================================================
 # SIGNAL ANALYSIS
 # ============================================================
 
-def analyze_market(symbol, trades, market_state, now_ts):
-    if not trades:
+def analyze_market(symbol, candles):
+    now_ts = int(time.time())
+
+    valid = [
+        candle for candle in candles
+        if isinstance(candle, dict)
+        and int(safe_float(candle.get("ts"), -1)) > 0
+        and safe_float(candle.get("close")) > 0
+        and int(safe_float(candle.get("ts"))) + CANDLE_SECONDS <= now_ts
+    ]
+
+    valid.sort(key=lambda candle: int(candle["ts"]))
+
+    # Keep the most recent copy of each candle.
+    unique = {}
+    for candle in valid:
+        unique[int(candle["ts"])] = candle
+
+    candles = [unique[ts] for ts in sorted(unique)]
+
+    # The last candle must be recent enough to be useful.
+    if candles:
+        age_minutes = (now_ts - int(candles[-1]["ts"])) / 60.0
+
+        if age_minutes > MAX_MARKET_AGE_MINUTES + 15:
+            return {
+                "status": "WAIT",
+                "reason": "آخرین کندل بیش از حد قدیمی است",
+            }
+
+    if len(candles) < MIN_CANDLES:
         return {
             "status": "WAIT",
-            "reason": "داده معتبر معاملات موجود نیست"
-        }
-
-    last_trade = trades[-1]
-    price = last_trade["price"]
-    age_minutes = (now_ts - last_trade["time"]) / 60.0
-
-    if age_minutes < -2:
-        return {
-            "status": "WAIT",
-            "price": price,
-            "reason": "زمان آخرین معامله نامعتبر است"
-        }
-
-    if age_minutes > MAX_TRADE_AGE_MINUTES:
-        return {
-            "status": "WAIT",
-            "price": price,
-            "reason": "آخرین معامله بیش از حد قدیمی است"
-        }
-
-    candles = get_closed_candles(market_state, now_ts)
-
-    if not consecutive_enough(candles, MIN_CLOSED_CANDLES):
-        return {
-            "status": "WAIT",
-            "price": price,
             "reason": (
-                f"تاریخچه ناکافی؛ {MIN_CLOSED_CANDLES} "
-                "کندل بسته‌شده پیوسته لازم است"
-            )
+                f"تاریخچه ناکافی؛ {MIN_CANDLES} کندل بسته‌شده لازم است "
+                f"(فعلی: {len(candles)})"
+            ),
         }
 
-    recent = candles[-MIN_CLOSED_CANDLES:]
-    confirmation = recent[-1]
-    previous = recent[-2]
-    support_candles = recent[:-1]
+    closes = [float(c["close"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    volumes = [max(0.0, float(c.get("volume", 0))) for c in candles]
 
-    support = min(
-        number(candle.get("low"))
-        for candle in support_candles
-    )
+    last = candles[-1]
+    previous = candles[-2]
+
+    close = closes[-1]
+    open_price = float(last["open"])
+    low = float(last["low"])
+    high = float(last["high"])
+
+    ema9 = ema(closes[-20:], 9)
+    ema20 = ema(closes[-20:], 20)
+    prior_ema20 = ema(closes[-21:-1], 20)
+    current_rsi = rsi(closes, 14)
+
+    if current_rsi is None:
+        return {
+            "status": "WAIT",
+            "reason": "داده کافی برای RSI وجود ندارد",
+        }
+
+    # Support is calculated from prior candles, excluding the current one.
+    support_window = lows[-21:-1]
+    support = min(support_window)
 
     if support <= 0:
         return {
             "status": "WAIT",
-            "price": price,
-            "reason": "حمایت قابل محاسبه نیست"
+            "reason": "محاسبه حمایت معتبر نیست",
         }
 
-    distance = (price - support) / support
-    near_support = -0.002 <= distance <= SUPPORT_ZONE_PERCENT
+    support_distance_pct = (close - support) / support * 100.0
 
-    bullish = (
-        number(confirmation.get("close"))
-        > number(confirmation.get("open"))
+    average_volume = (
+        sum(volumes[-21:-1]) / max(1, len(volumes[-21:-1]))
+    )
+    current_volume = volumes[-1]
+
+    bullish_candle = close > open_price
+    trend_ok = close > ema9 and ema20 >= prior_ema20
+    rsi_ok = 45 <= current_rsi <= 68
+    near_support = 0 <= support_distance_pct <= 1.8
+
+    volume_ok = (
+        average_volume <= 0
+        or current_volume >= average_volume * 0.8
     )
 
-    higher_close = (
-        number(confirmation.get("close"))
-        > number(previous.get("close"))
-    )
+    # Reject a candle that is too extended above the support zone.
+    not_overextended = close <= ema9 * 1.025
 
-    breakout_confirmation = (
-        number(confirmation.get("close"))
-        > number(previous.get("high"))
-    )
+    score = 0
+    if bullish_candle:
+        score += 20
+    if trend_ok:
+        score += 25
+    if rsi_ok:
+        score += 20
+    if near_support:
+        score += 20
+    if volume_ok:
+        score += 10
+    if not_overextended:
+        score += 5
 
-    confirmed = bullish and higher_close and breakout_confirmation
+    checks_passed = all([
+        bullish_candle,
+        trend_ok,
+        rsi_ok,
+        near_support,
+        volume_ok,
+        not_overextended,
+    ])
+
+    if checks_passed and score >= 85:
+        # Paper spot entry only; no real order is ever sent.
+        entry = close
+        stop = min(support * 0.99, low * 0.995)
+
+        if stop <= 0 or stop >= entry:
+            return {
+                "status": "WAIT",
+                "reason": "حد ضرر قابل‌محاسبه نیست",
+            }
+
+        risk = entry - stop
+        tp1 = entry + risk * 1.5
+        tp2 = entry + risk * 2.0
+        tp3 = entry + risk * 3.0
+
+        return {
+            "status": "BUY",
+            "symbol": symbol,
+            "score": score,
+            "entry": entry,
+            "stop": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "rsi": current_rsi,
+            "support": support,
+            "support_distance_pct": support_distance_pct,
+            "candle_ts": int(last["ts"]),
+        }
+
+    if near_support and bullish_candle:
+        return {
+            "status": "WATCH",
+            "score": score,
+            "reason": "نزدیک حمایت و کندل صعودی؛ تأیید کامل نشده",
+        }
+
+    reasons = []
 
     if not near_support:
-        return {
-            "status": "WAIT",
-            "price": price,
-            "support": support,
-            "reason": "قیمت در محدوده مناسب حمایت نیست"
-        }
-
-    if not confirmed:
-        return {
-            "status": "WATCH",
-            "price": price,
-            "support": support,
-            "reason": "نزدیک حمایت است اما تأیید صعودی کامل نیست"
-        }
-
-    entry = price
-
-    stop = min(
-        support * 0.99,
-        number(confirmation.get("low")) * 0.995
-    )
-
-    risk = entry - stop
-
-    if entry <= 0 or risk <= 0:
-        return {
-            "status": "WAIT",
-            "price": price,
-            "reason": "محاسبه حد ضرر نامعتبر است"
-        }
-
-    stop_percent = risk / entry * 100
-
-    if stop_percent > MAX_STOP_PERCENT * 100:
-        return {
-            "status": "WATCH",
-            "price": price,
-            "support": support,
-            "reason": "فاصله حد ضرر بیش از حد زیاد است"
-        }
-
-    budget = CAPITAL_USDT / MAX_SIGNALS
+        reasons.append("فاصله از حمایت")
+    if not bullish_candle:
+        reasons.append("کندل صعودی تأیید نشده")
+    if not trend_ok:
+        reasons.append("روند EMA تأیید نشده")
+    if not rsi_ok:
+        reasons.append("RSI خارج از محدوده")
+    if not volume_ok:
+        reasons.append("حجم ضعیف")
+    if not not_overextended:
+        reasons.append("قیمت بیش از حد از EMA فاصله دارد")
 
     return {
-        "status": "BUY",
-        "price": price,
-        "support": support,
-        "entry": entry,
-        "stop": stop,
-        "tp1": entry + risk,
-        "tp2": entry + risk * 1.8,
-        "tp3": entry + risk * 2.5,
-        "stop_percent": stop_percent,
-        "budget": budget,
-        "quantity": budget / entry,
-        "reason": "حمایت و کندل بسته‌شده تأیید شدند"
+        "status": "WAIT",
+        "score": score,
+        "reason": "، ".join(reasons) or "شرایط خرید کامل نیست",
     }
 
 
 # ============================================================
-# TELEGRAM REPORT
+# REPORT
 # ============================================================
 
-def format_signal(symbol, result, index):
-    return (
-        f"🟢 سیگنال خرید اسپات {index}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 بازار: {symbol}\n"
-        f"📍 ورود فرضی: {fmt_price(result['entry'])}\n"
-        f"🛑 حد ضرر: {fmt_price(result['stop'])}\n"
-        f"🎯 TP1: {fmt_price(result['tp1'])}\n"
-        f"🎯 TP2: {fmt_price(result['tp2'])}\n"
-        f"🎯 TP3: {fmt_price(result['tp3'])}\n"
-        f"📉 فاصله حد ضرر: {result['stop_percent']:.2f}%\n"
-        f"💰 بودجه فرضی: {result['budget']:.2f} USDT\n"
-        f"📦 مقدار فرضی: {result['quantity']:.8f}\n"
-        f"📊 حمایت: {fmt_price(result['support'])}\n"
-        f"🕒 {utc_text()}\n"
-        f"🧪 فقط آزمایشی؛ بدون سفارش واقعی"
-    )
+def fmt_price(value):
+    value = safe_float(value)
+
+    if value >= 1000:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:.5f}"
+    return f"{value:.8f}"
 
 
-# ============================================================
-# MAIN SCAN
-# ============================================================
+def build_report(symbols, history, persistence_ok, duration):
+    markets = history.get("markets", {})
+    buys = []
+    watches = 0
+    waits = 0
+    reasons = {}
+    analysis_errors = 0
 
-def run_scan():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing."
-        )
-
-    started = time.time()
-    logging.info("Starting %s", BOT_NAME)
-
-    state, state_sha = load_state()
-    market_states = state.setdefault("markets", {})
-
-    markets = fetch_markets()
-
-    stats = {
-        "checked": 0,
-        "errors": 0,
-        "wait": 0,
-        "watch": 0
-    }
-
-    buy_signals = []
-    watch_items = []
-    wait_reasons = {}
-    rate_limited = False
-
-    for market in markets:
-        symbol = market.get("_bot_symbol")
-
-        if not symbol:
-            continue
-
-        stats["checked"] += 1
-
+    for symbol in symbols:
         try:
-            trades = fetch_trades(symbol)
-
-            old_state = market_states.get(
-                symbol,
-                empty_market_state()
-            )
-
-            updated_state = update_market_history(
-                old_state,
-                trades,
-                time.time()
-            )
-
-            market_states[symbol] = updated_state
-
             result = analyze_market(
                 symbol,
-                trades,
-                updated_state,
-                time.time()
+                markets.get(symbol, []),
             )
 
             status = result.get("status", "WAIT")
 
             if status == "BUY":
-                buy_signals.append((symbol, result))
-
+                buys.append(result)
             elif status == "WATCH":
-                stats["watch"] += 1
-
-                if len(watch_items) < 5:
-                    watch_items.append((symbol, result))
-
+                watches += 1
             else:
-                stats["wait"] += 1
-                reason = result.get(
-                    "reason", "شرایط ورود کامل نیست"
-                )
-                wait_reasons[reason] = (
-                    wait_reasons.get(reason, 0) + 1
-                )
-
-        except RateLimitError as exc:
-            rate_limited = True
-            stats["errors"] += 1
-            logging.error("%s; stopping scan to protect API.", exc)
-            break
+                waits += 1
+                reason = result.get("reason", "نامشخص")
+                reasons[reason] = reasons.get(reason, 0) + 1
 
         except Exception as exc:
-            stats["errors"] += 1
-            logging.warning(
-                "Analysis failed for %s: %s",
-                symbol, exc
-            )
+            analysis_errors += 1
+            waits += 1
+            reason = "خطای تحلیل"
+            reasons[reason] = reasons.get(reason, 0) + 1
+            logging.exception("Analysis failed for %s: %s", symbol, exc)
 
-        time.sleep(REQUEST_DELAY_SECONDS)
+    buys.sort(key=lambda item: item.get("score", 0), reverse=True)
+    buys = buys[:MAX_SIGNALS]
 
-    buy_signals.sort(
-        key=lambda item: item[1].get("stop_percent", 100)
-    )
-    buy_signals = buy_signals[:MAX_SIGNALS]
-
-    state["updated_at"] = utc_text()
-    saved = save_state(state, state_sha)
+    # The simulated capital is divided among available signal slots.
+    per_signal_budget = CAPITAL_USDT / MAX_SIGNALS
 
     lines = [
         BOT_NAME,
         "━━━━━━━━━━━━━━━━━━",
         "📊 گزارش اسکن بازار بیت‌پین",
-        f"🕒 {utc_text()}",
+        "🕒 " + utc_text(),
         "━━━━━━━━━━━━━━━━━━",
         f"💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT",
-        f"📈 بازارهای بررسی‌شده: {stats['checked']}",
-        f"🟢 خریدهای تأییدشده: {len(buy_signals)}",
-        f"🟡 موارد تحت نظر: {stats['watch']}",
-        f"⚪ موارد انتظار: {stats['wait']}",
-        f"⚠️ خطاهای تحلیل: {stats['errors']}",
-        f"💾 ذخیره تاریخچه: {'موفق' if saved else 'ناموفق'}",
-        f"⏱ زمان اجرا: {time.time() - started:.1f} ثانیه",
-        "",
+        "📦 بودجه فرضی هر سیگنال: "
+        f"{per_signal_budget:.2f} USDT",
+        f"📈 بازارهای بررسی‌شده: {len(symbols)}",
+        f"🟢 خریدهای تأییدشده: {len(buys)}",
+        f"🟡 موارد تحت نظر: {watches}",
+        f"⚪ موارد انتظار: {waits}",
+        f"⚠️ خطاهای تحلیل: {analysis_errors}",
+        "💾 ذخیره تاریخچه: "
+        + ("موفق" if persistence_ok else "ناموفق/فقط محلی"),
+        f"⏱ زمان اجرا: {duration:.1f} ثانیه",
         "🧪 فقط سیگنال آزمایشی اسپات",
         "🚫 سفارش واقعی: خاموش",
-        "━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━",
     ]
 
-    if rate_limited:
-        lines.extend([
-            "",
-            "⛔ محدودیت API بیت‌پین فعال شد.",
-            "اسکن برای جلوگیری از درخواست‌های بیشتر متوقف شد."
-        ])
+    if buys:
+        lines.append("🟢 سیگنال‌های خرید آزمایشی")
 
-    if buy_signals:
-        lines.append("")
+        for index, item in enumerate(buys, start=1):
+            lines.extend([
+                "",
+                f"{index}. {item['symbol']} | امتیاز {item['score']}/100",
+                f"🟢 Entry: {fmt_price(item['entry'])}",
+                f"🛑 SL: {fmt_price(item['stop'])}",
+                f"🎯 TP1: {fmt_price(item['tp1'])}",
+                f"🎯 TP2: {fmt_price(item['tp2'])}",
+                f"🎯 TP3: {fmt_price(item['tp3'])}",
+                f"📊 RSI: {item['rsi']:.1f}",
+                f"📍 حمایت: {fmt_price(item['support'])}",
+                "📌 فاصله از حمایت: "
+                f"{item['support_distance_pct']:.2f}%",
+                f"💵 بودجه فرضی: {per_signal_budget:.2f} USDT",
+            ])
 
-        for index, (symbol, result) in enumerate(
-            buy_signals, start=1
-        ):
-            lines.append(format_signal(symbol, result, index))
-            lines.append("")
+    else:
+        lines.append("⚪ فعلاً سیگنال خرید تأییدشده‌ای وجود ندارد.")
 
-    elif not rate_limited:
-        lines.extend([
-            "",
-            "⚪ فعلاً سیگنال خرید تأییدشده‌ای وجود ندارد."
-        ])
-
-    if watch_items:
-        lines.extend([
-            "",
-            "🟡 موارد تحت نظر",
-            "━━━━━━━━━━━━━━━━━━"
-        ])
-
-        for symbol, result in watch_items:
-            lines.append(
-                f"• {symbol} | قیمت: "
-                f"{fmt_price(result.get('price', 0))} | "
-                f"حمایت: {fmt_price(result.get('support', 0))}"
-            )
-            lines.append(f"  علت: {result.get('reason', '')}")
-
-    if wait_reasons:
+    if reasons:
         lines.extend(["", "📌 دلایل پرتکرار انتظار:"])
 
         for reason, count in sorted(
-            wait_reasons.items(),
-            key=lambda item: item[1],
-            reverse=True
-        )[:3]:
+            reasons.items(),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )[:5]:
             lines.append(f"• {reason}: {count}")
 
-    message = "\n".join(lines)
+    lines.extend([
+        "",
+        "⚠️ سوددهی یا نرخ برد تضمین‌شده نیست.",
+        "این ربات سفارش ثبت نمی‌کند.",
+    ])
 
-    if len(message) > 3900:
-        message = message[:3800] + "\nگزارش کوتاه شد."
+    return "\n".join(lines)
 
-    delivered = send_telegram(message)
 
-    logging.info(
-        "Scan complete. Telegram=%s | stats=%s",
-        delivered, stats
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    started = time.time()
+
+    if not PAPER_MODE or REAL_ORDERS_ENABLED:
+        raise RuntimeError(
+            "Safety check failed: paper mode must be enabled "
+            "and real orders must remain disabled."
+        )
+
+    telegram_send(
+        BOT_NAME
+        + "\n✅ نسخه WebSocket Paper Bot شروع شد."
+        + f"\n💰 سرمایه آزمایشی: {CAPITAL_USDT:.2f} USDT"
+        + "\n📊 تایم‌فریم: 15m"
+        + "\n🧪 فقط سیگنال اسپات آزمایشی"
+        + "\n🚫 سفارش واقعی خاموش"
     )
+
+    try:
+        symbols = get_markets()
+        history = load_history()
+
+        new_candles = collect_candles(symbols)
+        history = update_history(history, new_candles)
+
+        persistence_ok = save_history(history)
+
+        report = build_report(
+            symbols,
+            history,
+            persistence_ok,
+            time.time() - started,
+        )
+
+        print(report)
+        telegram_send(report)
+
+    except Exception as exc:
+        logging.exception("Scan failed: %s", exc)
+
+        error_report = (
+            BOT_NAME
+            + "\n━━━━━━━━━━━━━━━━━━"
+            + "\n❌ اسکن کامل نشد"
+            + "\nعلت: " + str(exc)[:700]
+            + "\n🧪 حالت آزمایشی فعال است."
+            + "\n🚫 هیچ سفارش واقعی ثبت نشده است."
+        )
+
+        print(error_report)
+        telegram_send(error_report)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        run_scan()
-
-    except Exception as exc:
-        logging.exception("Scan failed")
-
-        send_telegram(
-            f"{BOT_NAME}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "❌ اسکن کامل نشد\n"
-            f"علت: {str(exc)[:700]}\n\n"
-            "🧪 حالت آزمایشی\n"
-            "🚫 سفارش واقعی خاموش"
-        )
-
-        raise
+    main()
