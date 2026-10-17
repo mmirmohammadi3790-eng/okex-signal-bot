@@ -36,10 +36,9 @@ SUPPORT_ZONE_PERCENT = 0.012
 MAX_STOP_PERCENT = 0.045
 MAX_TRADE_AGE_MINUTES = 30
 
-# Rate-limit controls
 REQUEST_DELAY_SECONDS = 1.5
-MAX_RETRIES_429 = 3
-RETRY_BASE_SECONDS = 5
+MAX_RETRIES = 3
+RETRY_BASE_SECONDS = 8
 REQUEST_TIMEOUT = 20
 
 STATE_PATH = "data/market_history.json"
@@ -67,9 +66,17 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-Paper-Bot/8.0",
+    "User-Agent": "ETH-WHALE-Paper-Bot/9.0",
     "Accept": "application/json"
 })
+
+
+# ============================================================
+# EXCEPTIONS
+# ============================================================
+
+class RateLimitError(Exception):
+    """Raised when the exchange continues rate limiting requests."""
 
 
 # ============================================================
@@ -106,10 +113,10 @@ def parse_timestamp(value):
         return stamp if stamp > 0 else 0.0
 
     if isinstance(value, str):
-        text = value.strip()
+        value = value.strip()
 
         try:
-            stamp = float(text)
+            stamp = float(value)
             if stamp > 100000000000:
                 stamp /= 1000.0
             return stamp if stamp > 0 else 0.0
@@ -117,10 +124,10 @@ def parse_timestamp(value):
             pass
 
         try:
-            if text.endswith("Z"):
-                text = text[:-1] + "+00:00"
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
 
-            dt = datetime.fromisoformat(text)
+            dt = datetime.fromisoformat(value)
 
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -133,8 +140,12 @@ def parse_timestamp(value):
 
 
 def api_get(url, params=None, timeout=REQUEST_TIMEOUT):
-    """GET with bounded retries for HTTP 429 and transient server errors."""
-    for attempt in range(MAX_RETRIES_429 + 1):
+    """
+    Retry only rate limits, transient server errors and network failures.
+    Client errors such as 400/404/406 are not retried.
+    """
+
+    for attempt in range(MAX_RETRIES + 1):
         try:
             response = SESSION.get(
                 url,
@@ -142,50 +153,51 @@ def api_get(url, params=None, timeout=REQUEST_TIMEOUT):
                 timeout=timeout
             )
 
-            if response.status_code == 429 or response.status_code in (
-                500, 502, 503, 504
-            ):
-                if attempt >= MAX_RETRIES_429:
-                    response.raise_for_status()
-
-                retry_after = number(
-                    response.headers.get("Retry-After"), 0
-                )
-
-                delay = max(
-                    retry_after,
-                    RETRY_BASE_SECONDS * (2 ** attempt)
-                )
-                delay += random.uniform(0.5, 2.0)
-
-                logging.warning(
-                    "HTTP %s; retry %s/%s in %.1fs",
-                    response.status_code,
-                    attempt + 1,
-                    MAX_RETRIES_429,
-                    delay
-                )
-
-                time.sleep(delay)
-                continue
-
-            response.raise_for_status()
-            return response.json()
-
         except requests.RequestException:
-            if attempt >= MAX_RETRIES_429:
+            if attempt >= MAX_RETRIES:
                 raise
 
             delay = RETRY_BASE_SECONDS * (2 ** attempt)
             delay += random.uniform(0.5, 2.0)
 
             logging.warning(
-                "Request failed; retry %s/%s in %.1fs",
-                attempt + 1,
-                MAX_RETRIES_429,
-                delay
+                "Network error; retry %s/%s in %.1fs",
+                attempt + 1, MAX_RETRIES, delay
             )
             time.sleep(delay)
+            continue
+
+        status = response.status_code
+
+        if status in (429, 500, 502, 503, 504):
+            if attempt >= MAX_RETRIES:
+                if status == 429:
+                    raise RateLimitError(
+                        "Bitpin HTTP 429 persisted after retries."
+                    )
+                response.raise_for_status()
+
+            retry_after = number(
+                response.headers.get("Retry-After"), 0
+            )
+
+            delay = max(
+                retry_after,
+                RETRY_BASE_SECONDS * (2 ** attempt)
+            )
+            delay += random.uniform(0.5, 2.0)
+
+            logging.warning(
+                "HTTP %s; retry %s/%s in %.1fs",
+                status, attempt + 1, MAX_RETRIES, delay
+            )
+
+            time.sleep(delay)
+            continue
+
+        # Do not retry other HTTP errors.
+        response.raise_for_status()
+        return response.json()
 
     raise RuntimeError("Request retries exhausted.")
 
@@ -424,7 +436,6 @@ def fetch_markets():
 
         base = symbol[:-5]
 
-        # These markets returned HTTP 406 in previous runs.
         if base in {"BUSD", "DAI", "PERP", "RDNT"}:
             continue
 
@@ -433,8 +444,6 @@ def fetch_markets():
         found[symbol] = market
 
     markets = list(found.values())
-
-    # Prioritize volume only where the API provides a value.
     markets.sort(
         key=lambda item: item.get("_bot_volume", 0),
         reverse=True
@@ -463,6 +472,10 @@ def fetch_trades(symbol):
     try:
         payload = api_get(url)
 
+    except RateLimitError:
+        # Propagate rate limit so the whole scan stops safely.
+        raise
+
     except requests.HTTPError as exc:
         response = exc.response
 
@@ -471,8 +484,7 @@ def fetch_trades(symbol):
         ):
             logging.warning(
                 "Skipping unsupported market %s (HTTP %s)",
-                symbol,
-                response.status_code
+                symbol, response.status_code
             )
             return []
 
@@ -627,9 +639,9 @@ def update_market_history(old_state, trades, now_ts):
         candle for bucket, candle in candle_map.items()
         if bucket >= cutoff
     ]
-
     candle_list.sort(key=lambda item: item["t"])
 
+    # Keep the newest IDs deterministically.
     seen_list = list(seen)
 
     if len(seen_list) > MAX_SEEN_TRADE_IDS:
@@ -856,6 +868,7 @@ def run_scan():
     buy_signals = []
     watch_items = []
     wait_reasons = {}
+    rate_limited = False
 
     for market in markets:
         symbol = market.get("_bot_symbol")
@@ -908,6 +921,12 @@ def run_scan():
                     wait_reasons.get(reason, 0) + 1
                 )
 
+        except RateLimitError as exc:
+            rate_limited = True
+            stats["errors"] += 1
+            logging.error("%s; stopping scan to protect API.", exc)
+            break
+
         except Exception as exc:
             stats["errors"] += 1
             logging.warning(
@@ -915,7 +934,6 @@ def run_scan():
                 symbol, exc
             )
 
-        # Keep request rate low.
         time.sleep(REQUEST_DELAY_SECONDS)
 
     buy_signals.sort(
@@ -946,6 +964,13 @@ def run_scan():
         "━━━━━━━━━━━━━━━━━━"
     ]
 
+    if rate_limited:
+        lines.extend([
+            "",
+            "⛔ محدودیت API بیت‌پین فعال شد.",
+            "اسکن برای جلوگیری از درخواست‌های بیشتر متوقف شد."
+        ])
+
     if buy_signals:
         lines.append("")
 
@@ -955,7 +980,7 @@ def run_scan():
             lines.append(format_signal(symbol, result, index))
             lines.append("")
 
-    else:
+    elif not rate_limited:
         lines.extend([
             "",
             "⚪ فعلاً سیگنال خرید تأییدشده‌ای وجود ندارد."
