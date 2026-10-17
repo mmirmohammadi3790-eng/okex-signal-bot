@@ -1,29 +1,24 @@
 
-import requests
 import json
-from datetime import datetime, timezone, timedelta
+import requests
+from datetime import datetime, timezone
 
 BASE_URL = "https://api.bitpin.org"
 SYMBOL = "BTC_USDT"
 
-# فقط بررسی مسیرهای احتمالی؛ هیچ سفارشی ثبت نمی‌شود.
 CANDIDATES = [
-    (
-        "/v1/mkt/market-candles/",
-        {"symbol": SYMBOL, "resolution": "15m", "limit": 50},
-    ),
-    (
-        "/v1/mkt/candles/",
-        {"symbol": SYMBOL, "resolution": "15m", "limit": 50},
-    ),
-    (
-        "/v1/mkt/market-candles/",
-        {"market": SYMBOL, "interval": "15m", "limit": 50},
-    ),
-    (
-        "/v1/mkt/candles/",
-        {"market": SYMBOL, "interval": "15m", "limit": 50},
-    ),
+    ("/v1/mkt/market-candles/", {
+        "symbol": SYMBOL, "resolution": "15m", "limit": 50
+    }),
+    ("/v1/mkt/candles/", {
+        "symbol": SYMBOL, "resolution": "15m", "limit": 50
+    }),
+    ("/v1/mkt/market-candles/", {
+        "market": SYMBOL, "interval": "15m", "limit": 50
+    }),
+    ("/v1/mkt/candles/", {
+        "market": SYMBOL, "interval": "15m", "limit": 50
+    }),
 ]
 
 session = requests.Session()
@@ -32,50 +27,54 @@ session.headers.update({
     "Accept": "application/json",
 })
 
-print("=" * 60)
-print("ETH WHALE - BITPIN CANDLE API DIAGNOSTIC")
-print("Paper mode: ON | Real orders: OFF")
-print("Time:", datetime.now(timezone.utc).isoformat())
-print("=" * 60)
+def print_json(data):
+    try:
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:2500])
+    except Exception:
+        print(str(data)[:2500])
 
-success = False
+print("=" * 60)
+print("BITPIN CANDLE API DIAGNOSTIC")
+print("UTC:", datetime.now(timezone.utc).isoformat())
+print("Symbol:", SYMBOL)
+print("Paper mode: ON")
+print("Real orders: OFF")
+print("=" * 60)
 
 for path, params in CANDIDATES:
     url = BASE_URL + path
-    print("\nTesting:", url)
-    print("Params:", params)
+    print("\n" + "-" * 60)
+    print("URL:", url)
+    print("PARAMS:", params)
 
     try:
         response = session.get(url, params=params, timeout=15)
         print("HTTP:", response.status_code)
-        print("Final URL:", response.url)
-        print("Content-Type:", response.headers.get("Content-Type"))
+        print("FINAL URL:", response.url)
+        print("CONTENT TYPE:", response.headers.get("Content-Type"))
 
         try:
             data = response.json()
-            if isinstance(data, dict):
-                print("Response keys:", list(data.keys()))
-            elif isinstance(data, list):
-                print("Response type: list")
-                print("List length:", len(data))
-            else:
-                print("Response type:", type(data).__name__)
-
-            print("Sample response:")
-            print(json.dumps(data, ensure_ascii=False)[:1800])
-
-            if response.ok:
-                print("HTTP request succeeded; endpoint still needs candle validation.")
-                success = True
         except ValueError:
-            print("Non-JSON response:")
-            print(response.text[:800])
+            print("RESPONSE TEXT:")
+            print(response.text[:1000])
+            continue
+
+        print("RESPONSE TYPE:", type(data).__name__)
+
+        if isinstance(data, dict):
+            print("RESPONSE KEYS:", list(data.keys()))
+
+        print("SAMPLE RESPONSE:")
+        print_json(data)
+
+        if response.ok:
+            print("HTTP_SUCCESS: True")
+        else:
+            print("HTTP_SUCCESS: False")
 
     except requests.RequestException as exc:
         print("REQUEST ERROR:", repr(exc))
 
-print("\n" + "=" * 60)
-print("Diagnostic finished.")
-print("Any HTTP 200 response must still be checked for real OHLC candle data.")
-print("No orders were submitted.")
-print("=" * 60)
+print("\nDIAGNOSTIC FINISHED")
+print("No trades or orders were submitted.")
