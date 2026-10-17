@@ -4,27 +4,32 @@ BASE = "https://api.bitpin.ir"
 s = requests.Session()
 s.headers.update({"User-Agent": "ETH-WHALE-PAPER-TEST/1.0"})
 
-# 1) دریافت قیمت از فهرست بازارها
-r = s.get(BASE + "/v1/mkt/markets/", timeout=15)
-print("MARKETS:", r.status_code)
-r.raise_for_status()
+try:
+    r = s.get(BASE + "/v1/mkt/markets/", timeout=15)
+    print("MARKETS STATUS:", r.status_code)
+    r.raise_for_status()
 
-markets = r.json().get("results", [])
-m = next((x for x in markets if x.get("code") == "BTC_USDT"), None)
+    markets = r.json().get("results", [])
+    market = next(
+        (m for m in markets if m.get("code") == "BTC_USDT"),
+        None
+    )
 
-if m:
-    print("BTC MARKET:", m.get("code"))
-    print("PRICE:", m.get("price"))
-    print("PRICE INFO:", m.get("price_info"))
-else:
-    print("BTC_USDT NOT FOUND")
+    if not market:
+        print("BTC_USDT NOT FOUND")
+        raise SystemExit(0)
 
-# 2) دریافت دفتر سفارش
-url = BASE + "/api/v1/mth/orderbook/BTC_USDT/"
-r = s.get(url, timeout=15)
-print("\nORDERBOOK:", r.status_code)
-r.raise_for_status()
+    market_id = market["id"]
+    print("MARKET:", market["code"])
+    print("MARKET ID:", market_id)
 
-book = r.json()
-print("BEST BID:", book.get("bids", [])[:1])
-print("BEST ASK:", book.get("asks", [])[:1])
+    # مسیر معاملات اخیر مطابق الگوی SDK عمومی بیت‌پین
+    url = f"{BASE}/api/v1/mth/actives/{market_id}/"
+
+    r = s.get(url, timeout=15)
+    print("TRADES URL:", url)
+    print("TRADES STATUS:", r.status_code)
+    print("TRADES BODY:", r.text[:1500])
+
+except Exception as e:
+    print("TEST ERROR:", repr(e))
