@@ -4,14 +4,15 @@ import json
 import time
 import base64
 import logging
+import random
 import requests
 
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 # ============================================================
-# ETH WHALE | BITPIN SPOT
-# PAPER SIGNALS ONLY - NO REAL ORDERS
+# ETH WHALE | BITPIN SPOT PAPER SIGNALS
+# NO REAL ORDERS - NO FUTURES - NO LEVERAGE
 # ============================================================
 
 BOT_NAME = "🐋 ETH WHALE"
@@ -22,7 +23,7 @@ MARKETS_URL = f"{BASE_URL}/v1/mkt/markets/"
 TRADES_URL = f"{BASE_URL}/api/v1/mth/matches/"
 
 CAPITAL_USDT = 48.0
-MAX_MARKETS = 100
+MAX_MARKETS = 25
 MAX_SIGNALS = 3
 
 CANDLE_MINUTES = 15
@@ -34,6 +35,12 @@ MAX_SEEN_TRADE_IDS = 5000
 SUPPORT_ZONE_PERCENT = 0.012
 MAX_STOP_PERCENT = 0.045
 MAX_TRADE_AGE_MINUTES = 30
+
+# Rate-limit controls
+REQUEST_DELAY_SECONDS = 1.5
+MAX_RETRIES_429 = 3
+RETRY_BASE_SECONDS = 5
+REQUEST_TIMEOUT = 20
 
 STATE_PATH = "data/market_history.json"
 
@@ -60,7 +67,7 @@ logging.basicConfig(
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "ETH-WHALE-Paper-Bot/7.0",
+    "User-Agent": "ETH-WHALE-Paper-Bot/8.0",
     "Accept": "application/json"
 })
 
@@ -93,19 +100,19 @@ def parse_timestamp(value):
         return 0.0
 
     if isinstance(value, (int, float)):
-        result = float(value)
-        if result > 100000000000:
-            result /= 1000
-        return result if result > 0 else 0.0
+        stamp = float(value)
+        if stamp > 100000000000:
+            stamp /= 1000.0
+        return stamp if stamp > 0 else 0.0
 
     if isinstance(value, str):
         text = value.strip()
 
         try:
-            result = float(text)
-            if result > 100000000000:
-                result /= 1000
-            return result if result > 0 else 0.0
+            stamp = float(text)
+            if stamp > 100000000000:
+                stamp /= 1000.0
+            return stamp if stamp > 0 else 0.0
         except ValueError:
             pass
 
@@ -125,14 +132,62 @@ def parse_timestamp(value):
     return 0.0
 
 
-def api_get(url, params=None, timeout=15):
-    response = SESSION.get(
-        url,
-        params=params,
-        timeout=timeout
-    )
-    response.raise_for_status()
-    return response.json()
+def api_get(url, params=None, timeout=REQUEST_TIMEOUT):
+    """GET with bounded retries for HTTP 429 and transient server errors."""
+    for attempt in range(MAX_RETRIES_429 + 1):
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=timeout
+            )
+
+            if response.status_code == 429 or response.status_code in (
+                500, 502, 503, 504
+            ):
+                if attempt >= MAX_RETRIES_429:
+                    response.raise_for_status()
+
+                retry_after = number(
+                    response.headers.get("Retry-After"), 0
+                )
+
+                delay = max(
+                    retry_after,
+                    RETRY_BASE_SECONDS * (2 ** attempt)
+                )
+                delay += random.uniform(0.5, 2.0)
+
+                logging.warning(
+                    "HTTP %s; retry %s/%s in %.1fs",
+                    response.status_code,
+                    attempt + 1,
+                    MAX_RETRIES_429,
+                    delay
+                )
+
+                time.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException:
+            if attempt >= MAX_RETRIES_429:
+                raise
+
+            delay = RETRY_BASE_SECONDS * (2 ** attempt)
+            delay += random.uniform(0.5, 2.0)
+
+            logging.warning(
+                "Request failed; retry %s/%s in %.1fs",
+                attempt + 1,
+                MAX_RETRIES_429,
+                delay
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Request retries exhausted.")
 
 
 def send_telegram(message):
@@ -153,17 +208,11 @@ def send_telegram(message):
                 "text": message,
                 "disable_web_page_preview": True
             },
-            timeout=20
+            timeout=REQUEST_TIMEOUT
         )
 
         response.raise_for_status()
-        result = response.json()
-
-        if not result.get("ok"):
-            logging.error("Telegram did not confirm delivery.")
-            return False
-
-        return True
+        return bool(response.json().get("ok"))
 
     except Exception as exc:
         logging.error("Telegram send failed: %s", exc)
@@ -198,7 +247,7 @@ def load_state():
     empty = {"markets": {}}
 
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        logging.warning("Persistent history is not configured.")
+        logging.warning("GitHub persistence is not configured.")
         return empty, None
 
     url = (
@@ -210,7 +259,7 @@ def load_state():
         response = SESSION.get(
             url,
             headers=github_headers(),
-            timeout=15
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code == 404:
@@ -273,7 +322,7 @@ def save_state(state, sha):
             url,
             headers=github_headers(),
             json=payload,
-            timeout=25
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code not in (200, 201):
@@ -354,10 +403,8 @@ def fetch_markets():
 
     if isinstance(payload, list):
         rows = payload
-
     elif isinstance(payload, dict):
         rows = payload.get("results", [])
-
     else:
         rows = []
 
@@ -375,10 +422,10 @@ def fetch_markets():
         if not symbol:
             continue
 
-        # Skip common non-trading/legacy stablecoin pairs.
         base = symbol[:-5]
 
-        if base in {"BUSD", "DAI"}:
+        # These markets returned HTTP 406 in previous runs.
+        if base in {"BUSD", "DAI", "PERP", "RDNT"}:
             continue
 
         market["_bot_symbol"] = symbol
@@ -387,6 +434,7 @@ def fetch_markets():
 
     markets = list(found.values())
 
+    # Prioritize volume only where the API provides a value.
     markets.sort(
         key=lambda item: item.get("_bot_volume", 0),
         reverse=True
@@ -413,7 +461,7 @@ def fetch_trades(symbol):
     url = f"{TRADES_URL}{quote(symbol, safe='_')}/"
 
     try:
-        payload = api_get(url, timeout=15)
+        payload = api_get(url)
 
     except requests.HTTPError as exc:
         response = exc.response
@@ -432,7 +480,6 @@ def fetch_trades(symbol):
 
     if isinstance(payload, list):
         rows = payload
-
     elif isinstance(payload, dict):
         rows = (
             payload.get("results")
@@ -440,14 +487,13 @@ def fetch_trades(symbol):
             or payload.get("data")
             or []
         )
-
     else:
         rows = []
 
-    valid = []
-
     if not isinstance(rows, list):
-        return valid
+        return []
+
+    valid = []
 
     for trade in rows:
         if not isinstance(trade, dict):
@@ -491,7 +537,7 @@ def fetch_trades(symbol):
 
 
 # ============================================================
-# BUILD AND SAVE OBSERVED CANDLES
+# CANDLE HISTORY
 # ============================================================
 
 def empty_market_state():
@@ -578,8 +624,7 @@ def update_market_history(old_state, trades, now_ts):
     cutoff = now_ts - MAX_CANDLE_HISTORY * CANDLE_SECONDS
 
     candle_list = [
-        candle
-        for bucket, candle in candle_map.items()
+        candle for bucket, candle in candle_map.items()
         if bucket >= cutoff
     ]
 
@@ -612,8 +657,11 @@ def consecutive_enough(candles, count):
 
     recent = candles[-count:]
 
-    for i in range(1, len(recent)):
-        if int(recent[i]["t"]) - int(recent[i - 1]["t"]) != CANDLE_SECONDS:
+    for index in range(1, len(recent)):
+        if (
+            int(recent[index]["t"])
+            - int(recent[index - 1]["t"])
+        ) != CANDLE_SECONDS:
             return False
 
     return True
@@ -632,16 +680,16 @@ def analyze_market(symbol, trades, market_state, now_ts):
 
     last_trade = trades[-1]
     price = last_trade["price"]
-    age = (now_ts - last_trade["time"]) / 60.0
+    age_minutes = (now_ts - last_trade["time"]) / 60.0
 
-    if age < -2:
+    if age_minutes < -2:
         return {
             "status": "WAIT",
             "price": price,
             "reason": "زمان آخرین معامله نامعتبر است"
         }
 
-    if age > MAX_TRADE_AGE_MINUTES:
+    if age_minutes > MAX_TRADE_AGE_MINUTES:
         return {
             "status": "WAIT",
             "price": price,
@@ -663,9 +711,12 @@ def analyze_market(symbol, trades, market_state, now_ts):
     recent = candles[-MIN_CLOSED_CANDLES:]
     confirmation = recent[-1]
     previous = recent[-2]
-    earlier = recent[:-1]
+    support_candles = recent[:-1]
 
-    support = min(number(c.get("low")) for c in earlier)
+    support = min(
+        number(candle.get("low"))
+        for candle in support_candles
+    )
 
     if support <= 0:
         return {
@@ -675,7 +726,6 @@ def analyze_market(symbol, trades, market_state, now_ts):
         }
 
     distance = (price - support) / support
-
     near_support = -0.002 <= distance <= SUPPORT_ZONE_PERCENT
 
     bullish = (
@@ -756,7 +806,7 @@ def analyze_market(symbol, trades, market_state, now_ts):
 
 
 # ============================================================
-# MESSAGE FORMAT
+# TELEGRAM REPORT
 # ============================================================
 
 def format_signal(symbol, result, index):
@@ -818,18 +868,24 @@ def run_scan():
         try:
             trades = fetch_trades(symbol)
 
-            old_market_state = market_states.get(
-                symbol, empty_market_state()
+            old_state = market_states.get(
+                symbol,
+                empty_market_state()
             )
 
-            updated = update_market_history(
-                old_market_state, trades, time.time()
+            updated_state = update_market_history(
+                old_state,
+                trades,
+                time.time()
             )
 
-            market_states[symbol] = updated
+            market_states[symbol] = updated_state
 
             result = analyze_market(
-                symbol, trades, updated, time.time()
+                symbol,
+                trades,
+                updated_state,
+                time.time()
             )
 
             status = result.get("status", "WAIT")
@@ -845,16 +901,23 @@ def run_scan():
 
             else:
                 stats["wait"] += 1
-                reason = result.get("reason", "شرایط ورود کامل نیست")
-                wait_reasons[reason] = wait_reasons.get(reason, 0) + 1
+                reason = result.get(
+                    "reason", "شرایط ورود کامل نیست"
+                )
+                wait_reasons[reason] = (
+                    wait_reasons.get(reason, 0) + 1
+                )
 
         except Exception as exc:
             stats["errors"] += 1
-            logging.warning("Analysis failed for %s: %s", symbol, exc)
+            logging.warning(
+                "Analysis failed for %s: %s",
+                symbol, exc
+            )
 
-        time.sleep(0.12)
+        # Keep request rate low.
+        time.sleep(REQUEST_DELAY_SECONDS)
 
-    # Prioritize signals with a smaller stop distance.
     buy_signals.sort(
         key=lambda item: item[1].get("stop_percent", 100)
     )
