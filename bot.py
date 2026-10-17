@@ -1,23 +1,19 @@
-
 import requests
 
 BASE = "https://api.bitpin.ir"
-paths = [
-    "/v1/mkt/markets/",
-    "/v1/mkt/tickers/",
-    "/v1/mkt/ohlc/",
-    "/v1/mkt/candles/",
+
+tests = [
+    ("/v1/mkt/tickers/", {}),
+    ("/v1/mkt/tickers", {}),
+    ("/v1/mkt/markets/", {}),
+    ("/v1/mth/orderbook/BTC_USDT/", {}),
 ]
 
-for path in paths:
+for path, params in tests:
     try:
-        r = requests.get(
-            BASE + path,
-            params={"symbol": "BTC_USDT", "interval": "15"},
-            timeout=10,
-        )
-        print("\nPATH:", path)
+        r = requests.get(BASE + path, params=params, timeout=12)
+        print("\nPATH:", r.url)
         print("STATUS:", r.status_code)
-        print("BODY:", r.text[:350])
+        print("BODY:", r.text[:500].replace("\n", " "))
     except Exception as e:
-        print(path, "ERROR:", str(e)[:200])
+        print("\nERROR:", path, str(e)[:250])
