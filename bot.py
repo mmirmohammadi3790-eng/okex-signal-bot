@@ -1,92 +1,212 @@
 
 import requests
 from datetime import datetime, timezone
+from collections import defaultdict
 
-BASE = "https://api.bitpin.ir"
+# =========================================================
+# ETH WHALE | BITPIN TRADE & CANDLE TEST
+# PAPER ONLY - NO REAL ORDERS
+# =========================================================
+
+BASE_URL = "https://api.bitpin.ir"
 SYMBOL = "BTC_USDT"
-INTERVAL = 15 * 60
+INTERVAL_SECONDS = 15 * 60
+TIMEOUT = 20
 
-try:
-    r = requests.get(
-        f"{BASE}/api/v1/mth/matches/{SYMBOL}/",
-        timeout=15,
-        headers={"User-Agent": "ETH-WHALE-PAPER-TEST/1.0"},
+HEADERS = {
+    "User-Agent": "ETH-WHALE-PAPER-TEST/1.0",
+    "Accept": "application/json",
+}
+
+
+def utc_time(timestamp):
+    return datetime.fromtimestamp(
+        timestamp, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def fetch_trades():
+    url = f"{BASE_URL}/api/v1/mth/matches/{SYMBOL}/"
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=TIMEOUT,
     )
-    print("STATUS:", r.status_code)
-    r.raise_for_status()
 
-    trades = r.json()
-    trades = [
-        t for t in trades
-        if t.get("time") is not None
-        and t.get("price") is not None
-    ]
-    trades.sort(key=lambda t: float(t["time"]))
+    print("TRADES URL:", url)
+    print("TRADES STATUS:", response.status_code)
 
-    if not trades:
-        print("NO VALID TRADES")
-        raise SystemExit(0)
+    response.raise_for_status()
 
-    first = float(trades[0]["time"])
-    last = float(trades[-1]["time"])
+    data = response.json()
 
-    print("SYMBOL:", SYMBOL)
-    print("VALID TRADES:", len(trades))
-    print("OLDEST UTC:", datetime.fromtimestamp(
-        first, timezone.utc
-    ).isoformat())
-    print("NEWEST UTC:", datetime.fromtimestamp(
-        last, timezone.utc
-    ).isoformat())
-    print("COVERAGE MINUTES:", round((last - first) / 60, 2))
-
-    candles = {}
-
-    for t in trades:
-        ts = float(t["time"])
-        price = float(t["price"])
-        bucket = int(ts // INTERVAL) * INTERVAL
-
-        if bucket not in candles:
-            candles[bucket] = {
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "trades": 0,
-            }
-
-        c = candles[bucket]
-        c["high"] = max(c["high"], price)
-        c["low"] = min(c["low"], price)
-        c["close"] = price
-        c["trades"] += 1
-
-    now = datetime.now(timezone.utc).timestamp()
-    closed = [
-        (ts, c) for ts, c in sorted(candles.items())
-        if ts + INTERVAL <= now
-    ]
-
-    print("15M CANDLES FOUND:", len(candles))
-    print("CLOSED CANDLES:", len(closed))
-
-    for ts, c in sorted(candles.items())[-10:]:
-        print(
-            datetime.fromtimestamp(ts, timezone.utc).isoformat(),
-            c
+    if not isinstance(data, list):
+        raise ValueError(
+            "Unexpected API response: expected a list of trades"
         )
 
-    if closed:
-        ts, c = closed[-1]
-        print("LATEST CLOSED CANDLE:", datetime.fromtimestamp(
-            ts, timezone.utc
-        ).isoformat(), c)
+    valid = []
 
-    if (last - first) < INTERVAL:
-        print("WARNING: Trades do not cover a full 15-minute interval.")
-    if len(closed) < 20:
-        print("WARNING: Not enough closed candles for robust analysis.")
+    for item in data:
+        try:
+            timestamp = float(item["time"])
+            price = float(item["price"])
 
-except Exception as e:
-    print("TEST ERROR:", repr(e))
+            if timestamp <= 0 or price <= 0:
+                continue
+
+            valid.append({
+                "time": timestamp,
+                "price": price,
+                "amount": float(item.get("base_amount", 0) or 0),
+                "side": str(item.get("side", "unknown")),
+            })
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    valid.sort(key=lambda x: x["time"])
+    return valid
+
+
+def build_candles(trades):
+    buckets = defaultdict(list)
+
+    for trade in trades:
+        bucket = (
+            int(trade["time"] // INTERVAL_SECONDS)
+            * INTERVAL_SECONDS
+        )
+        buckets[bucket].append(trade)
+
+    candles = []
+
+    for timestamp in sorted(buckets):
+        items = buckets[timestamp]
+        prices = [x["price"] for x in items]
+
+        candles.append({
+            "timestamp": timestamp,
+            "open": prices[0],
+            "high": max(prices),
+            "low": min(prices),
+            "close": prices[-1],
+            "trades": len(items),
+            "volume": sum(x["amount"] for x in items),
+        })
+
+    return candles
+
+
+def main():
+    print("=" * 55)
+    print("🐋 ETH WHALE - BITPIN DATA TEST")
+    print("MODE: PAPER ONLY")
+    print("REAL ORDERS: OFF")
+    print("SYMBOL:", SYMBOL)
+    print("=" * 55)
+
+    try:
+        trades = fetch_trades()
+
+        print("VALID TRADES:", len(trades))
+
+        if not trades:
+            print("RESULT: No valid trades returned.")
+            return
+
+        first_time = trades[0]["time"]
+        last_time = trades[-1]["time"]
+
+        coverage = max(
+            0,
+            (last_time - first_time) / 60
+        )
+
+        print("OLDEST TRADE:", utc_time(first_time))
+        print("NEWEST TRADE:", utc_time(last_time))
+        print("COVERAGE MINUTES:", round(coverage, 2))
+        print("OLDEST PRICE:", trades[0]["price"])
+        print("NEWEST PRICE:", trades[-1]["price"])
+
+        candles = build_candles(trades)
+
+        now = datetime.now(timezone.utc).timestamp()
+
+        # Only candles whose full 15-minute period has ended.
+        closed_candles = [
+            candle for candle in candles
+            if candle["timestamp"] + INTERVAL_SECONDS <= now
+        ]
+
+        print("15M CANDLES FOUND:", len(candles))
+        print("CLOSED CANDLES:", len(closed_candles))
+
+        print("\n--- RECENT CANDLES (UTC) ---")
+
+        for candle in candles[-10:]:
+            candle_end = (
+                candle["timestamp"] + INTERVAL_SECONDS
+            )
+            status = (
+                "CLOSED"
+                if candle_end <= now
+                else "INCOMPLETE"
+            )
+
+            print(
+                utc_time(candle["timestamp"]),
+                "|", status,
+                "| O:", round(candle["open"], 8),
+                "| H:", round(candle["high"], 8),
+                "| L:", round(candle["low"], 8),
+                "| C:", round(candle["close"], 8),
+                "| TRADES:", candle["trades"],
+                "| VOLUME:", round(candle["volume"], 8),
+            )
+
+        if closed_candles:
+            latest = closed_candles[-1]
+
+            print("\n--- LATEST CLOSED CANDLE ---")
+            print("TIME:", utc_time(latest["timestamp"]))
+            print("OPEN:", latest["open"])
+            print("HIGH:", latest["high"])
+            print("LOW:", latest["low"])
+            print("CLOSE:", latest["close"])
+            print("TRADES:", latest["trades"])
+
+        print("\n--- DATA QUALITY ---")
+
+        if coverage < 15:
+            print("WARNING: Coverage is shorter than 15 minutes.")
+        else:
+            print("Coverage spans at least 15 minutes.")
+
+        if len(closed_candles) < 20:
+            print(
+                "WARNING: Fewer than 20 closed candles. "
+                "Insufficient for robust trend/support analysis."
+            )
+        else:
+            print("At least 20 closed candles are available.")
+
+        print(
+            "\nIMPORTANT: This uses only the returned recent trades. "
+            "It cannot reconstruct missing historical trades."
+        )
+        print("TEST FINISHED. NO ORDERS WERE PLACED.")
+
+    except requests.RequestException as exc:
+        print("NETWORK/API ERROR:", repr(exc))
+
+    except (ValueError, TypeError) as exc:
+        print("DATA ERROR:", repr(exc))
+
+    except Exception as exc:
+        print("UNEXPECTED ERROR:", repr(exc))
+
+
+if __name__ == "__main__":
+    main()
