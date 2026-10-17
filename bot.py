@@ -6,7 +6,7 @@ s.headers.update({"User-Agent": "ETH-WHALE-PAPER-TEST/1.0"})
 
 try:
     r = s.get(BASE + "/v1/mkt/markets/", timeout=15)
-    print("MARKETS STATUS:", r.status_code)
+    print("MARKETS:", r.status_code)
     r.raise_for_status()
 
     markets = r.json().get("results", [])
@@ -21,15 +21,14 @@ try:
 
     market_id = market["id"]
     print("MARKET:", market["code"])
-    print("MARKET ID:", market_id)
+    print("ID:", market_id)
 
-    # مسیر معاملات اخیر مطابق الگوی SDK عمومی بیت‌پین
-    url = f"{BASE}/api/v1/mth/actives/{market_id}/"
-
+    url = f"{BASE}/api/v1/mth/matches/{market_id}/"
     r = s.get(url, timeout=15)
+
     print("TRADES URL:", url)
     print("TRADES STATUS:", r.status_code)
     print("TRADES BODY:", r.text[:1500])
 
 except Exception as e:
-    print("TEST ERROR:", repr(e))
+    print("ERROR:", repr(e))
